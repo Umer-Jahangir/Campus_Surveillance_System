@@ -208,21 +208,26 @@ def decoder_worker(index, stream_url, shm_names, frame_shape,
         # Flip to the other slot for the next frame
         buf_idx ^= 1
 
-        try:
-            q_size = meta_queue.qsize()
-        except Exception:
-            q_size = 0
-
-        # Local files: fixed interval matching source FPS.
-        # RTSP streams: adaptive pacing based on queue depth.
-        if file_frame_interval > 0:
-            time.sleep(file_frame_interval)
-        else:
-            if not sent or q_size > 2:
-                pace_sleep = min(pace_sleep * (1 + ALPHA_DOWN), PACE_MAX)
-            elif q_size == 0:
-                pace_sleep = max(pace_sleep * (1 - ALPHA_UP), PACE_MIN)
-            time.sleep(pace_sleep)
+        # Optimized pacing: sample queue every 5th frame instead of every frame
+        sample_interval = 5
+        if (sent and not stop_event.is_set()) or (sent is False):
+            if file_frame_interval > 0:
+                # Local files: fixed interval matching source FPS
+                time.sleep(file_frame_interval)
+            else:
+                # RTSP: adaptive pacing (simplified — check queue less often)
+                if drop_count % sample_interval == 0:
+                    try:
+                        q_size = meta_queue.qsize()
+                    except Exception:
+                        q_size = 0
+                    
+                    if not sent or q_size > 2:
+                        pace_sleep = min(pace_sleep * (1 + ALPHA_DOWN), PACE_MAX)
+                    elif q_size == 0:
+                        pace_sleep = max(pace_sleep * (1 - ALPHA_UP), PACE_MIN)
+                
+                time.sleep(pace_sleep)
 
     cap.release()
     for shm in shm_slots:
