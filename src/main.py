@@ -1,368 +1,590 @@
+"""
+dashboard_server.py
+===================
+Flask + Socket.IO bridge that runs the OpenVINO multi-stream pipeline and
+streams annotated JPEG frames, detection events, and performance stats to
+the browser dashboard in real time.
+
+No cv2.imshow — all video output is in the browser.
+
+Usage:
+    python main.py
+Then open http://localhost:5000
+"""
+
+import base64
+import ctypes
+import json
 import multiprocessing
 import multiprocessing.shared_memory
+import os
 import sys
 import time
+import threading
+from queue import Empty
+
 import cv2
 import numpy as np
-from queue import Empty
 import psutil
-import os
+from flask import Flask, jsonify, request, send_from_directory
+from flask_socketio import SocketIO
 
-import ctypes
+# ── project imports ────────────────────────────────────────────────────────
 from worker import decoder_worker, inference_worker
 from monitor import monitor_worker
 from utils import compute_fps, summarize_latency
 
+# ── app setup ──────────────────────────────────────────────────────────────
+app = Flask(__name__, static_folder="static", template_folder="templates")
+app.config["SECRET_KEY"] = "ov-dashboard-secret-2025"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                    logger=False, engineio_logger=False)
 
-def compute_cores_per_decoder(num_streams):
+# ── frame / pipeline constants ─────────────────────────────────────────────
+FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS = 256, 320, 3
+FRAME_SHAPE  = (FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS)
+FRAME_SIZE   = FRAME_HEIGHT * FRAME_WIDTH * FRAME_CHANNELS
+JPEG_QUALITY = 70         # balance: quality vs bandwidth
+MAX_ALERTS   = 200         # rolling alert history kept in memory
+
+# ── global state ───────────────────────────────────────────────────────────
+_lock = threading.Lock()
+
+state = {
+    "running":           False,
+    "restarting":        False,   # True while pipeline hot-restarts
+    "streams":           [],      # [{"url": str, "label": str}, ...]
+    # live process handles
+    "decoder_procs":     [],
+    "inference_proc":    None,
+    "monitor_proc":      None,
+    # IPC
+    "stop_event":        None,
+    "inference_alive":   None,
+    "meta_queues":       [],
+    "result_queue":      None,
+    "shared_cpu":        None,
+    "shared_ram":        None,
+    # shared memory
+    "shm_objects":       [],
+    "shm_names":         [],
+    # per-stream statistics (indexed by stream id)
+    "stats":             {},
+}
+
+# rolling alert list  [{stream_id, label, conf, track_id, ts}, ...]
+alerts: list = []
+alert_lock = threading.Lock()
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def compute_cores_per_decoder(num_streams: int) -> int:
     total = psutil.cpu_count(logical=False) or 4
-    inference_reserve = max(2, total // 4)
-    decoder_pool = total - inference_reserve
-    per_decoder = max(1, decoder_pool // num_streams)
-    while (per_decoder * num_streams) > (total - 2) and per_decoder > 1:
-        per_decoder -= 1
-    return per_decoder
+    reserve = max(2, total // 4)
+    pool = total - reserve
+    per = max(1, pool // num_streams)
+    while (per * num_streams) > (total - 2) and per > 1:
+        per -= 1
+    return per
 
 
-def create_tiled_dashboard(frames_dict, num_streams):
-    active = []
-    ref_size = None
-    for i in range(num_streams):
-        f = frames_dict.get(i)
-        if f is not None:
-            if ref_size is None:
-                ref_size = (f.shape[1], f.shape[0])
-                active.append(f)
-            else:
-                if (f.shape[1], f.shape[0]) != ref_size:
-                    f = cv2.resize(f, ref_size)
-                active.append(f)
-    if not active:
-        return None
-    return np.hstack(active)
-
-
-def collect_video_sources(args):
-    """Convert command-line arguments into a list of video sources.
-       If an argument is a directory, include all video files inside.
-       Supported extensions: .mp4, .avi, .mkv, .mov, .wmv, .flv, .mjpeg
-    """
-    video_extensions = ('.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.mjpeg')
-    sources = []
-    for arg in args:
-        if os.path.isdir(arg):
-            for file in sorted(os.listdir(arg)):  # sorted for determinism (#7)
-                if file.lower().endswith(video_extensions):
-                    full_path = os.path.join(arg, file)
-                    sources.append(full_path)
-        elif os.path.isfile(arg):
-            sources.append(arg)
-        else:
-            sources.append(arg)
-    return sources
-
-
-def draw_boxes(frame, boxes, ids, classes, confs):
-
+def annotate_frame(frame: np.ndarray, boxes, track_ids, labels, confs) -> np.ndarray:
+    """Draw bounding boxes + labels on a copy of frame."""
+    out = frame.copy()
     if boxes is None:
-        return frame
-
-    for box, track_id, cls, conf in zip(boxes, ids, classes, confs):
-
+        return out
+    for bi, box in enumerate(boxes):
         x1, y1, x2, y2 = map(int, box)
-
-        track_id = -1 if track_id is None else int(track_id)
-        conf = float(conf)
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        id_text = f"ID {track_id}"
-        class_text = f"{cls}"
-        conf_text = f"{conf:.2f}"
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.5
-        thickness = 2
-        padding = 4
-
-        (w1, h1), _ = cv2.getTextSize(id_text, font, scale, thickness)
-        (w2, h2), _ = cv2.getTextSize(class_text, font, scale, thickness)
-        (w3, h3), _ = cv2.getTextSize(conf_text, font, scale, thickness)
-
-        total_width = w1 + w2 + w3 + padding * 4
-        label_height = max(h1, h2, h3) + padding * 2
-
-        cv2.rectangle(
-            frame,
-            (x1, y1 - label_height),
-            (x1 + total_width, y1),
-            (255, 255, 255),
-            -1
-        )
-
-        text_y = y1 - padding
-
-        cv2.putText(frame, id_text, (x1 + padding, text_y),
-                    font, scale, (0, 0, 0), thickness)
-        cv2.putText(frame, class_text, (x1 + w1 + padding * 2, text_y),
-                    font, scale, (0, 255, 0), thickness)
-        cv2.putText(frame, conf_text, (x1 + w1 + w2 + padding * 3, text_y),
-                    font, scale, (255, 0, 0), thickness)
-
-    return frame
+        tid  = int(track_ids[bi]) if track_ids is not None else -1
+        lbl  = labels[bi] if labels else "?"
+        conf = float(confs[bi]) if confs is not None else 0.0
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 80), 2)
+        tag = f"{lbl} {conf:.2f} #{tid}"
+        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        cv2.rectangle(out, (x1, max(y1-th-6, 0)), (x1+tw+4, y1), (0, 255, 80), -1)
+        cv2.putText(out, tag, (x1+2, max(y1-4, th)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1)
+    return out
 
 
-if __name__ == "__main__":
+def frame_to_b64(frame: np.ndarray) -> str:
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return base64.b64encode(buf).decode("utf-8")
 
-    multiprocessing.set_start_method("spawn", force=True)
 
-    # Set Windows timer resolution to 1ms (default is ~15ms) so that
-    # time.sleep() in decoders is accurate and decoder pacing jitter
-    # is reduced from ±15ms to ±1ms.
-    try:
-        ctypes.windll.winmm.timeBeginPeriod(1)
-    except Exception:
-        pass  # non-Windows — no-op
+def _stats_snapshot(s: dict) -> dict:
+    m_avg, m_p95, m_max = summarize_latency(s["model_latencies"])
+    p_avg, p_p95, p_max = summarize_latency(s["pipeline_latencies"])
+    dur = 0.0
+    if s["start_time"] and s["end_time"]:
+        dur = s["end_time"] - s["start_time"]
+    return {
+        "fps":     round(s["live_fps"], 1),
+        "frames":  s["frames"],
+        "dropped": s.get("dropped", 0),
+        "duration": round(dur, 1),
+        "model": {
+            "avg": round(m_avg, 1),
+            "p95": round(m_p95, 1),
+            "max": round(m_max, 1),
+        },
+        "e2e": {
+            "avg": round(p_avg, 1),
+            "p95": round(p_p95, 1),
+            "max": round(p_max, 1),
+        },
+    }
 
-    raw_args = sys.argv[1:]
-    stream_urls = collect_video_sources(raw_args)
 
-    if not stream_urls:
-        print("Usage for test with local files: python main.py D:\Projects\real_time_vedio\src\videos")
-        print("Usage for test with rtsp: python main.py rtsp://localhost:8554/Name1 ....")
-        print("Sources can be video files, directories, or stream URLs (RTSP, HTTP, etc.)")
-        sys.exit(1)
+# ── emit loop ──────────────────────────────────────────────────────────────
 
-    num_streams = len(stream_urls)
-    stop_event = multiprocessing.Event()
-    inference_alive = multiprocessing.Event()
+def _emit_loop():
+    """
+    Runs in a daemon thread.  Drains result_queue, encodes frames as JPEG,
+    and emits Socket.IO events to all connected browsers.
+    """
+    last_sys_emit = time.monotonic()
 
-    cores_per_decoder = compute_cores_per_decoder(num_streams)
-    total_cores = psutil.cpu_count(logical=False) or 4
-    print(f"[Main] {total_cores} physical cores | "
-          f"{cores_per_decoder} per decoder | "
-          f"{num_streams} streams")
-    print(f"[Main] Sources: {stream_urls}")
+    while True:
+        with _lock:
+            running = state["running"]
+            rq      = state["result_queue"]
+            stop_ev = state["stop_event"]
 
-    # Shared memory — 2 slots (double-buffer) per stream (#1)
-    frame_height, frame_width, frame_channels = 256, 320, 3
-    frame_shape = (frame_height, frame_width, frame_channels)
-    frame_size = frame_height * frame_width * frame_channels
+        if not running or rq is None:
+            time.sleep(0.05)
+            continue
 
-    shm_objects = []
-    shm_names = []
+        if stop_ev and stop_ev.is_set():
+            time.sleep(0.1)
+            continue
 
-    for i in range(num_streams):
-        shm_a = multiprocessing.shared_memory.SharedMemory(create=True, size=frame_size)
-        shm_b = multiprocessing.shared_memory.SharedMemory(create=True, size=frame_size)
-        shm_objects.append((shm_a, shm_b))
-        shm_names.append((shm_a.name, shm_b.name))
+        # ── drain result queue ────────────────────────────────────────────
+        try:
+            for _ in range(48):
+                msg = rq.get_nowait()
+                if msg[0] != "frame":
+                    continue
 
-    meta_queues = [multiprocessing.Queue(maxsize=8) for _ in range(num_streams)]
-    result_queue = multiprocessing.Queue(maxsize=512)
+                (_, idx, frame, boxes, track_ids, classes, confs, labels,
+                 capture_time, model_lat, e2e_lat) = msg
 
-    # Start inference
-    inference_p = multiprocessing.Process(
-        target=inference_worker,
-        args=(num_streams, frame_shape, shm_names,
-              meta_queues, result_queue, stop_event,
-              inference_alive,
-              num_streams, cores_per_decoder),
-    )
-    inference_p.start()
+                with _lock:
+                    s = state["stats"].get(idx)
+                if s is None:
+                    continue
 
-    # Start decoders
-    decoder_processes = []
-    for i, url in enumerate(stream_urls):
-        p = multiprocessing.Process(
-            target=decoder_worker,
-            args=(i, url, shm_names[i], frame_shape,
-                  meta_queues[i], stop_event, inference_alive,
-                  num_streams, cores_per_decoder),
-        )
-        p.start()
-        decoder_processes.append(p)
+                # update stats
+                now_t = time.perf_counter()
+                if s["start_time"] is None:
+                    s["start_time"] = capture_time
+                s["end_time"] = capture_time
+                s["frames"] += 1
 
-    # Start monitor
-    shared_cpu = multiprocessing.Value('d', 0.0)
-    shared_ram = multiprocessing.Value('d', 0.0)
-    monitor_p = multiprocessing.Process(
-        target=monitor_worker, args=(shared_cpu, shared_ram, stop_event)
-    )
-    monitor_p.start()
+                if len(s["model_latencies"]) >= 1000:
+                    s["model_latencies"].pop(0)
+                s["model_latencies"].append(model_lat)
 
-    # Stats
-    stats = {i: {
-        "frames": 0,
-        "model_latencies": [],
-        "pipeline_latencies": [],
-        "start_time": None,
-        "end_time": None,
-        "last_fps_time": time.time(),
-        "last_fps_frames": 0,
-        "live_fps": 0.0,
-    } for i in range(num_streams)}
+                if len(s["pipeline_latencies"]) >= 1000:
+                    s["pipeline_latencies"].pop(0)
+                s["pipeline_latencies"].append(e2e_lat)
 
-    system_cpu = []
-    system_ram = []
-    latest_frames = {i: None for i in range(num_streams)}
-    last_log_time = time.time()
-    LOG_INTERVAL = 5.0
-
-    # Dashboard rate limiter (#5)
-    last_dashboard_time = 0.0
-    DASHBOARD_INTERVAL = 1.0 / 30.0  # cap at 30 fps
-
-    print("🚀 All pipelines started. Press 'q' to quit.")
-
-    try:
-        last_frame_time = time.time()
-
-        while True:
-            # Drain result queue — capped at 64 per iteration (#4)
-            try:
-                for _ in range(64):
-                    msg = result_queue.get_nowait()
-                    if msg[0] == "frame":
-                        (
-                            _,
-                            idx,
-                            frame,
-                            boxes,
-                            track_ids,
-                            classes,
-                            confs,
-                            labels,
-                            capture_time,
-                            model_lat,
-                            e2e_lat
-                        ) = msg
-
-                        s = stats[idx]
-                        if s["start_time"] is None:
-                            s["start_time"] = capture_time
-                        s["end_time"] = capture_time
-                        s["frames"] += 1
-                        # Rolling window of 1000 samples (#10)
-                        if len(s["model_latencies"]) >= 1000:
-                            s["model_latencies"].pop(0)
-                        s["model_latencies"].append(model_lat)
-                        if len(s["pipeline_latencies"]) >= 1000:
-                            s["pipeline_latencies"].pop(0)
-                        s["pipeline_latencies"].append(e2e_lat)
-                        # Draw on a copy to avoid mutating shared frame (#6)
-                        frame = draw_boxes(frame.copy(), boxes, track_ids, labels, confs)
-                        latest_frames[idx] = frame
-                        last_frame_time = time.time()
-            except Empty:
-                pass
-
-            # Live FPS
-            now_t = time.time()
-            for i, s in stats.items():
                 elapsed = now_t - s["last_fps_time"]
                 if elapsed >= 1.0:
                     s["live_fps"] = (s["frames"] - s["last_fps_frames"]) / elapsed
-                    s["last_fps_time"] = now_t
+                    s["last_fps_time"]   = now_t
                     s["last_fps_frames"] = s["frames"]
 
-            # Exit when all decoders done and queue has been quiet for 2s
-            # DEBUG print removed (#8)
-            all_decoders_dead = all(not p.is_alive() for p in decoder_processes)
-            if all_decoders_dead and (now_t - last_frame_time > 2.0):
-                print("[Main] All streams finished. Exiting.")
-                break
+                # build detection payload + alert entries
+                det_list = []
+                if boxes is not None and len(boxes):
+                    for bi in range(len(boxes)):
+                        det_list.append({
+                            "label":    labels[bi] if labels else "object",
+                            "conf":     round(float(confs[bi]), 3) if confs is not None else 0.0,
+                            "track_id": int(track_ids[bi]) if track_ids is not None else -1,
+                            "box":      [int(v) for v in boxes[bi]],
+                        })
 
-            # System stats — rolling window of 1000 samples (#9)
-            cpu = shared_cpu.value
-            ram = shared_ram.value
-            if len(system_cpu) >= 1000:
-                system_cpu.pop(0)
-                system_ram.pop(0)
-            system_cpu.append(cpu)
-            system_ram.append(ram)
+                    with alert_lock:
+                        stream_label = (state["streams"][idx]["label"]
+                                        if idx < len(state["streams"]) else f"S{idx}")
+                        for d in det_list:
+                            alerts.append({
+                                "stream_id":    idx,
+                                "stream_label": stream_label,
+                                "label":        d["label"],
+                                "conf":         d["conf"],
+                                "track_id":     d["track_id"],
+                                "ts":           time.time(),
+                            })
+                        # trim
+                        del alerts[:max(0, len(alerts) - MAX_ALERTS)]
 
-            # Periodic console log
-            if now_t - last_log_time >= LOG_INTERVAL:
-                for i in range(num_streams):
-                    s = stats[i]
-                    if s["model_latencies"]:
-                        print(f"Stream {i} | FPS: {s['live_fps']:.1f} | "
-                              f"Model: {s['model_latencies'][-1]:.1f}ms | "
-                              f"E2E: {s['pipeline_latencies'][-1]:.1f}ms")
-                last_log_time = now_t
+                # annotate + encode
+                annotated = annotate_frame(frame, boxes, track_ids, labels, confs)
+                b64 = frame_to_b64(annotated)
 
-            # Dashboard — rate-limited to 30fps (#5)
-            if now_t - last_dashboard_time >= DASHBOARD_INTERVAL:
-                dashboard = create_tiled_dashboard(latest_frames, num_streams)
-                if dashboard is not None:
-                    cv2.putText(dashboard, f"CPU: {cpu:.1f}%  RAM: {ram:.1f}%",
-                                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    tile_w = dashboard.shape[1] // max(num_streams, 1)
-                    for i in range(num_streams):
-                        cv2.putText(dashboard,
-                                    f"S{i} {stats[i]['live_fps']:.1f}fps",
-                                    (i * tile_w + 5, 55),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-                    cv2.imshow("OpenVINO Dashboard", dashboard)
-                last_dashboard_time = now_t
+                socketio.emit("frame_update", {
+                    "stream_id":  idx,
+                    "frame":      b64,
+                    "detections": det_list,
+                    "stats":      _stats_snapshot(s),
+                })
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                # dedicated alert event (only when objects detected)
+                if det_list:
+                    socketio.emit("detection_alert", {
+                        "stream_id":    idx,
+                        "stream_label": (state["streams"][idx]["label"]
+                                         if idx < len(state["streams"]) else f"S{idx}"),
+                        "detections":   det_list,
+                        "ts":           time.time(),
+                    })
 
+        except Empty:
+            pass
+
+        # ── system stats (every 0.5 s) ────────────────────────────────────
+        now_mono = time.monotonic()
+        if now_mono - last_sys_emit >= 0.5:
+            with _lock:
+                cpu = state["shared_cpu"].value if state["shared_cpu"] else 0.0
+                ram = state["shared_ram"].value if state["shared_ram"] else 0.0
+            socketio.emit("system_stats", {
+                "cpu": round(cpu, 1),
+                "ram": round(ram, 1),
+            })
+            last_sys_emit = now_mono
+
+        time.sleep(0.012)   # ~83 Hz poll; actual frame rate limited by source
+
+
+threading.Thread(target=_emit_loop, daemon=True, name="emit-loop").start()
+
+
+# ── pipeline lifecycle ─────────────────────────────────────────────────────
+
+def _start_pipeline(streams: list) -> None:
+    """Must be called while holding _lock."""
+    num_streams = len(streams)
+    stream_urls = [s["url"] for s in streams]
+    cpp = compute_cores_per_decoder(num_streams)
+
+    stop_event      = multiprocessing.Event()
+    inference_alive = multiprocessing.Event()
+
+    shm_objects, shm_names = [], []
+    for _ in range(num_streams):
+        sa = multiprocessing.shared_memory.SharedMemory(create=True, size=FRAME_SIZE)
+        sb = multiprocessing.shared_memory.SharedMemory(create=True, size=FRAME_SIZE)
+        shm_objects.append((sa, sb))
+        shm_names.append((sa.name, sb.name))
+
+    meta_queues  = [multiprocessing.Queue(maxsize=8) for _ in range(num_streams)]
+    result_queue = multiprocessing.Queue(maxsize=512)
+    shared_cpu   = multiprocessing.Value('d', 0.0)
+    shared_ram   = multiprocessing.Value('d', 0.0)
+
+    inf_proc = multiprocessing.Process(
+        target=inference_worker,
+        args=(num_streams, FRAME_SHAPE, shm_names,
+              meta_queues, result_queue, stop_event,
+              inference_alive, num_streams, cpp),
+    )
+    inf_proc.start()
+
+    dec_procs = []
+    for i, url in enumerate(stream_urls):
+        p = multiprocessing.Process(
+            target=decoder_worker,
+            args=(i, url, shm_names[i], FRAME_SHAPE,
+                  meta_queues[i], stop_event, inference_alive,
+                  num_streams, cpp),
+        )
+        p.start()
+        dec_procs.append(p)
+
+    mon_proc = multiprocessing.Process(
+        target=monitor_worker, args=(shared_cpu, shared_ram, stop_event)
+    )
+    mon_proc.start()
+
+    per_stream_stats = {}
+    for i in range(num_streams):
+        per_stream_stats[i] = {
+            "frames": 0, "dropped": 0,
+            "model_latencies": [], "pipeline_latencies": [],
+            "start_time": None, "end_time": None,
+            "last_fps_time": time.perf_counter(),
+            "last_fps_frames": 0, "live_fps": 0.0,
+        }
+
+    state.update({
+        "running":        True,
+        "restarting":     False,
+        "decoder_procs":  dec_procs,
+        "inference_proc": inf_proc,
+        "monitor_proc":   mon_proc,
+        "stop_event":     stop_event,
+        "inference_alive":inference_alive,
+        "meta_queues":    meta_queues,
+        "result_queue":   result_queue,
+        "shared_cpu":     shared_cpu,
+        "shared_ram":     shared_ram,
+        "shm_objects":    shm_objects,
+        "shm_names":      shm_names,
+        "stats":          per_stream_stats,
+    })
+
+
+def _stop_pipeline() -> None:
+    """Gracefully shuts down all processes and frees shared memory."""
+    if not state["running"]:
+        return
+
+    state["stop_event"].set()
+
+    all_procs = (state["decoder_procs"]
+                 + [state["inference_proc"], state["monitor_proc"]])
+    for p in all_procs:
+        if not p:
+            continue
+        p.join(timeout=5)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=3)
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=2)
+
+    for sa, sb in state["shm_objects"]:
+        for shm in (sa, sb):
+            try: shm.close()
+            except Exception: pass
+            try: shm.unlink()
+            except Exception: pass
+
+    state.update({
+        "running": False,
+        "restarting": False,
+        "decoder_procs": [], "inference_proc": None, "monitor_proc": None,
+        "stop_event": None, "inference_alive": None,
+        "meta_queues": [], "result_queue": None,
+        "shared_cpu": None, "shared_ram": None,
+        "shm_objects": [], "shm_names": [],
+        "stats": {},
+    })
+
+
+def _hot_restart(streams: list) -> None:
+    """
+    Stop the running pipeline and restart with a new stream list.
+    Must be called while holding _lock.
+    """
+    state["restarting"] = True
+    _stop_pipeline()
+    if streams:
+        _start_pipeline(streams)
+
+
+# ── REST endpoints ─────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return send_from_directory("templates", "dashboard.html")
+
+
+@app.route("/api/status")
+def api_status():
+    with _lock:
+        return jsonify({
+            "running":     state["running"],
+            "restarting":  state["restarting"],
+            "streams":     state["streams"],
+            "num_streams": len(state["streams"]),
+        })
+
+
+@app.route("/api/streams", methods=["GET"])
+def api_get_streams():
+    with _lock:
+        return jsonify({"streams": state["streams"],
+                        "running": state["running"]})
+
+
+@app.route("/api/streams", methods=["POST"])
+def api_add_stream():
+    data  = request.get_json(silent=True) or {}
+    url   = (data.get("url") or "").strip()
+    label = (data.get("label") or f"Stream {len(state['streams'])+1}").strip()
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+
+    with _lock:
+        was_running = state["running"]
+        state["streams"].append({"url": url, "label": label})
+        snap = list(state["streams"])
+        if was_running:
+            # Hot-restart: stop then restart with updated stream list
+            socketio.emit("pipeline_status", {
+                "running": False, "restarting": True,
+                "num_streams": len(snap)
+            })
+            _hot_restart(snap)
+
+    socketio.emit("streams_changed", {"streams": snap})
+    if was_running:
+        socketio.emit("pipeline_status", {
+            "running": True, "restarting": False,
+            "num_streams": len(snap)
+        })
+    return jsonify({"ok": True, "streams": snap, "restarted": was_running}), 201
+
+
+@app.route("/api/streams/<int:idx>", methods=["DELETE"])
+def api_remove_stream(idx: int):
+    with _lock:
+        if not (0 <= idx < len(state["streams"])):
+            return jsonify({"error": "Index out of range"}), 404
+        was_running = state["running"]
+        state["streams"].pop(idx)
+        snap = list(state["streams"])
+        if was_running:
+            socketio.emit("pipeline_status", {
+                "running": False, "restarting": True,
+                "num_streams": len(snap)
+            })
+            if snap:
+                _hot_restart(snap)
+            else:
+                _stop_pipeline()
+
+    socketio.emit("streams_changed", {"streams": snap})
+    if was_running:
+        socketio.emit("pipeline_status", {
+            "running": bool(snap), "restarting": False,
+            "num_streams": len(snap)
+        })
+    return jsonify({"ok": True, "streams": snap, "restarted": was_running})
+
+
+@app.route("/api/streams/<int:idx>", methods=["PATCH"])
+def api_update_stream(idx: int):
+    data = request.get_json(silent=True) or {}
+    with _lock:
+        if not (0 <= idx < len(state["streams"])):
+            return jsonify({"error": "Index out of range"}), 404
+        was_running = state["running"]
+        if "url"   in data: state["streams"][idx]["url"]   = data["url"].strip()
+        if "label" in data: state["streams"][idx]["label"] = data["label"].strip()
+        snap = list(state["streams"])
+        if was_running and "url" in data:
+            # URL changed — hot-restart needed
+            socketio.emit("pipeline_status", {
+                "running": False, "restarting": True,
+                "num_streams": len(snap)
+            })
+            _hot_restart(snap)
+
+    socketio.emit("streams_changed", {"streams": snap})
+    if was_running and "url" in data:
+        socketio.emit("pipeline_status", {
+            "running": True, "restarting": False,
+            "num_streams": len(snap)
+        })
+    return jsonify({"ok": True, "streams": snap})
+
+
+@app.route("/api/start", methods=["POST"])
+def api_start():
+    with _lock:
+        if state["running"]:
+            return jsonify({"error": "Already running"}), 409
+        if not state["streams"]:
+            return jsonify({"error": "Add at least one stream first"}), 400
+        _start_pipeline(state["streams"])
+    socketio.emit("pipeline_status", {
+        "running": True, "restarting": False,
+        "num_streams": len(state["streams"])
+    })
+    return jsonify({"ok": True})
+
+
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    with _lock:
+        _stop_pipeline()
+    socketio.emit("pipeline_status", {"running": False, "restarting": False})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/alerts")
+def api_alerts():
+    limit = int(request.args.get("limit", 100))
+    stream_id = request.args.get("stream_id")
+    with alert_lock:
+        if stream_id is not None:
+            filtered = [a for a in alerts if str(a["stream_id"]) == str(stream_id)]
+        else:
+            filtered = list(alerts)
+        recent = list(reversed(filtered[-limit:]))
+    return jsonify({"alerts": recent, "total": len(filtered)})
+
+
+@app.route("/api/stats")
+def api_stats():
+    with _lock:
+        out = {}
+        for i, s in state["stats"].items():
+            out[i] = _stats_snapshot(s)
+        return jsonify({"stats": out, "streams": state["streams"]})
+
+
+@app.route("/api/alerts/clear", methods=["POST"])
+def api_clear_alerts():
+    with alert_lock:
+        alerts.clear()
+    socketio.emit("alerts_cleared", {})
+    return jsonify({"ok": True})
+
+
+# ── Socket.IO events ───────────────────────────────────────────────────────
+
+@socketio.on("connect")
+def on_connect():
+    with _lock:
+        emit_initial = {
+            "running":    state["running"],
+            "restarting": state["restarting"],
+            "streams":    state["streams"],
+        }
+    socketio.emit("initial_state", emit_initial)
+
+
+# ── entry point ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
+
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass  # non-Windows no-op
+
+    print("=" * 60)
+    print("  OpenVINO Multi-Stream Dashboard")
+    print("  http://localhost:5000")
+    print("=" * 60)
+
+    try:
+        socketio.run(app, host="0.0.0.0", port=5000, debug=False,
+                     allow_unsafe_werkzeug=True)
     finally:
-        print("[Main] Shutting down...")
-        stop_event.set()
-
-        all_procs = decoder_processes + [inference_p, monitor_p]
-        for p in all_procs:
-            p.join(timeout=5)
-            if p.is_alive():
-                print(f"[Main] PID {p.pid} still alive — terminating...")
-                p.terminate()
-                p.join(timeout=3)
-                if p.is_alive():
-                    print(f"[Main] PID {p.pid} not terminating — killing...")
-                    p.kill()
-                    p.join(timeout=2)
-
-        for shm_a, shm_b in shm_objects:
-            for shm in (shm_a, shm_b):
-                try:
-                    shm.close()
-                except Exception:
-                    pass
-                try:
-                    shm.unlink()
-                except Exception:
-                    pass
-
-        cv2.destroyAllWindows()
+        with _lock:
+            _stop_pipeline()
         try:
             ctypes.windll.winmm.timeEndPeriod(1)
         except Exception:
             pass
-        print("[Main] Cleanup complete.")
-
-        print("\n=== Performance Report ===")
-        for i in range(num_streams):
-            s = stats[i]
-            if not s["start_time"] or not s["end_time"]:
-                print(f"\nPipeline {i+1}: No data collected.")
-                continue
-
-            duration = s["end_time"] - s["start_time"]
-            fps = compute_fps(s["frames"], duration)
-            model_avg, model_p95, model_max = summarize_latency(s["model_latencies"])
-            pipe_avg,  pipe_p95,  pipe_max  = summarize_latency(s["pipeline_latencies"])
-
-            print(f"\nPipeline {i+1}")
-            print(f"  Frames : {s['frames']}")
-            print(f"  FPS    : {fps:.2f}")
-            print(f"  Model   -> Avg: {model_avg:.2f} ms | P95: {model_p95:.2f} | Max: {model_max:.2f}")
-            print(f"  E2E     -> Avg: {pipe_avg:.2f} ms | P95: {pipe_p95:.2f} | Max: {pipe_max:.2f}")
-
-        if system_cpu:
-            print("\nSystem Usage:")
-            print(f"  Avg CPU : {sum(system_cpu)/len(system_cpu):.2f}%")
-            print(f"  Avg RAM : {sum(system_ram)/len(system_ram):.2f}%")
+        print("[Server] Shutdown complete.")
