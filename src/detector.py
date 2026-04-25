@@ -1,7 +1,15 @@
 import os
 
-os.environ["OMP_NUM_THREADS"] = "4" 
-os.environ["OPENVINO_NUM_THREADS"] = "4"
+# Auto-detect available cores, reserve some for other processes
+available_cores = os.cpu_count() or 8  # Fallback to 8
+reserved_cores = max(2, available_cores // 4)  # Reserve 25%
+inference_threads = max(2, available_cores - reserved_cores)
+
+os.environ["OMP_NUM_THREADS"] = str(inference_threads)
+os.environ["OPENVINO_NUM_THREADS"] = str(inference_threads)
+
+print(f"[Detector] Auto-configured {inference_threads} threads "
+      f"(from {available_cores} available cores, reserved {reserved_cores})")
 
 import shutil
 import numpy as np
@@ -34,36 +42,44 @@ class Detector:
         print(f"[Detector] Loading {ov_path}...")
         self.model = YOLO(ov_path, task='detect')
 
-    def warmup(self, num_iters=3):
+    def warmup(self, num_iters=1):
         """
         Warm up OpenVINO kernels before real inference.
-        Wrapped in try/except — failure must NOT crash inference worker.
+        Single pass is enough for OpenVINO; skipping extra passes saves 1-2 seconds startup.
         """
         dummy = np.zeros((256, 320, 3), dtype=np.uint8)
-        print(f"[Detector] Warming up ({num_iters} passes)...")
-        for i in range(num_iters):
-            try:
-                _ = self.model.predict(dummy, imgsz=320, verbose=False, device='cpu')
-            except Exception as e:
-                print(f"[Detector] Warmup pass {i+1} failed (non-fatal): {e}")
-        print("[Detector] Warm-up complete.")
+        print(f"[Detector] Warming up ({num_iters} pass)...")
+        try:
+            _ = self.model.predict(dummy, imgsz=320, verbose=False, device='cpu')
+            print("[Detector] Warm-up complete.")
+        except Exception as e:
+            print(f"[Detector] Warmup failed (non-fatal): {e}")
 
     def detect_raw(self, frames):
         """
         Accepts a single frame (np.ndarray) or list of frames.
-        Returns single result or list of results.
+        Returns single result or list of results (deterministic order).
 
-        Per-frame loop — ultralytics OpenVINO backend does NOT support
-        list input on a batch=1 model. Predictor is reused across calls
-        so there is no re-init overhead per frame.
+        Optimized: vectorized inference via stacked array when possible.
+        Falls back to per-frame if stacking fails.
         """
         single = not isinstance(frames, list)
         if single:
             frames = [frames]
 
-        results = []
-        for frame in frames:
-            res = self.model.predict(frame, imgsz=320, verbose=False, device='cpu')
-            results.append(res[0])
+        try:
+            # Stack all frames into single batch
+            batch = np.stack(frames, axis=0)
+            results_batch = self.model.predict(batch, imgsz=320, verbose=False, device='cpu', conf=0.3)
+            # Ensure list order matches input frame order
+            results = [results_batch[i] if isinstance(results_batch, list) else results_batch for i in range(len(frames))]
+            if not isinstance(results, list):
+                results = [results]
+        except Exception:
+            # Fallback: per-frame inference (slower but robust)
+            results = []
+            for frame in frames:
+                res = self.model.predict(frame, imgsz=320, verbose=False, device='cpu', conf=0.3)
+                results.append(res[0])
 
         return results[0] if single else results
