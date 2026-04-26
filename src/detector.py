@@ -1,85 +1,112 @@
 import os
-
-# Auto-detect available cores, reserve some for other processes
-available_cores = os.cpu_count() or 8  # Fallback to 8
-reserved_cores = max(2, available_cores // 4)  # Reserve 25%
-inference_threads = max(2, available_cores - reserved_cores)
-
-os.environ["OMP_NUM_THREADS"] = str(inference_threads)
-os.environ["OPENVINO_NUM_THREADS"] = str(inference_threads)
-
-print(f"[Detector] Auto-configured {inference_threads} threads "
-      f"(from {available_cores} available cores, reserved {reserved_cores})")
-
 import shutil
+import logging
 import numpy as np
 from ultralytics import YOLO
 
+# ----------------------------------------------------------------------
+# Thread configuration (avoids oversubscription on CPU)
+# ----------------------------------------------------------------------
+import psutil as _det_psutil
+_det_threads = max(1, (_det_psutil.cpu_count(logical=False) or 2) // 2)
+os.environ.setdefault("OMP_NUM_THREADS",      str(_det_threads))
+os.environ.setdefault("OPENVINO_NUM_THREADS", str(_det_threads))
+del _det_psutil, _det_threads
 
+# ----------------------------------------------------------------------
 class Detector:
-    def __init__(self, model_path='models/yolov8n.pt'):
-        # NO batch_size parameter — removed completely
+    """YOLOv8 pose + OpenVINO inference wrapper (per‑frame inference)."""
 
-        if model_path.endswith('.pt'):
-            ov_path = model_path.replace('.pt', '_openvino_model')
+    def __init__(self, model_path: str = "models/yolov8n-pose.pt",
+                 imgsz: int = 320, confidence: float = 0.3,
+                 warmup_iters: int = 1):
+        """
+        Args:
+            model_path: Path to .pt or OpenVINO export directory.
+            imgsz: Inference image size (square, will be letterboxed).
+            confidence: Confidence threshold for detections.
+            warmup_iters: Number of warmup iterations.
+        """
+        self._imgsz = imgsz
+        self._confidence = confidence
+        self._warmup_iters = warmup_iters
+
+        # Prepare OpenVINO model path
+        if model_path.endswith(".pt"):
+            ov_path = model_path.replace(".pt", "_openvino_model")
         else:
             ov_path = model_path
 
+        # Export to OpenVINO if not already present
         if not os.path.exists(ov_path):
             print(f"[Detector] Exporting {model_path} to OpenVINO FP16...")
             base_model = YOLO(model_path)
-            base_model.export(format='openvino', half=True, imgsz=320)
-            # Move exported folder to correct location if needed
-            raw = model_path.replace('.pt', '_openvino_model')
+            base_model.export(format="openvino", half=True,
+                              imgsz=self._imgsz, task="pose")
+
+            raw = model_path.replace(".pt", "_openvino_model")
             if os.path.exists(raw) and raw != ov_path:
                 if os.path.exists(ov_path):
                     shutil.rmtree(ov_path)
                 shutil.move(raw, ov_path)
-            print(f"[Detector] Export complete -> {ov_path}")
+            print(f"[Detector] Export complete → {ov_path}")
         else:
             print(f"[Detector] Using existing model at {ov_path}")
 
+        # Load model
         print(f"[Detector] Loading {ov_path}...")
-        self.model = YOLO(ov_path, task='detect')
+        self.model = YOLO(ov_path, task="pose")
 
-    def warmup(self, num_iters=1):
-        """
-        Warm up OpenVINO kernels before real inference.
-        Single pass is enough for OpenVINO; skipping extra passes saves 1-2 seconds startup.
-        """
-        dummy = np.zeros((256, 320, 3), dtype=np.uint8)
-        print(f"[Detector] Warming up ({num_iters} pass)...")
-        try:
-            _ = self.model.predict(dummy, imgsz=320, verbose=False, device='cpu')
-            print("[Detector] Warm-up complete.")
-        except Exception as e:
-            print(f"[Detector] Warmup failed (non-fatal): {e}")
+    # ------------------------------------------------------------------
+    def warmup(self, num_iters: int = None):
+        """Warm up with the correct frame shape (256x320) for real decoder output."""
+        if num_iters is None:
+            num_iters = self._warmup_iters
+        dummy = np.zeros((256, self._imgsz, 3), dtype=np.uint8)
+        print(f"[Detector] Warming up ({num_iters} passes)...")
+        for i in range(num_iters):
+            try:
+                _ = self.model.predict(dummy, imgsz=self._imgsz,
+                                       verbose=False, device="cpu")
+            except Exception as e:
+                print(f"[Detector] Warmup pass {i+1} failed (non‑fatal): {e}")
+        print("[Detector] Warm‑up complete.")
 
+    # ------------------------------------------------------------------
     def detect_raw(self, frames):
         """
-        Accepts a single frame (np.ndarray) or list of frames.
-        Returns single result or list of results (deterministic order).
+        Perform inference on one or more frames.
 
-        Optimized: vectorized inference via stacked array when possible.
-        Falls back to per-frame if stacking fails.
+        Args:
+            frames: Single frame (H,W,3) or list of frames.
+
+        Returns:
+            Single YOLO Result object if input was a single frame,
+            otherwise a list of Result objects (one per input frame).
         """
         single = not isinstance(frames, list)
         if single:
             frames = [frames]
 
-        try:
-            # Stack all frames into single batch
-            batch = np.stack(frames, axis=0)
-            results_batch = self.model.predict(batch, imgsz=320, verbose=False, device='cpu', conf=0.3)
-            # Ensure list order matches input frame order
-            results = [results_batch[i] if isinstance(results_batch, list) else results_batch for i in range(len(frames))]
-            if not isinstance(results, list):
-                results = [results]
-        except Exception:
-            # Fallback: per-frame inference (slower but robust)
-            results = []
-            for frame in frames:
-                res = self.model.predict(frame, imgsz=320, verbose=False, device='cpu', conf=0.3)
-                results.append(res[0])
+        results = []
+        for frame in frames:
+            # Ensure contiguous uint8 layout
+            if not (frame.flags["C_CONTIGUOUS"] and frame.dtype == np.uint8):
+                frame = np.ascontiguousarray(frame, dtype=np.uint8)
+
+            try:
+                res = self.model.predict(
+                    frame,
+                    imgsz=self._imgsz,
+                    conf=self._confidence,
+                    verbose=False,
+                    device="cpu",
+                )
+                # predict always returns a list for multiple inputs,
+                # but we give a single frame → take the first element
+                results.append(res[0] if isinstance(res, list) else res)
+            except Exception as e:
+                print(f"[Detector] Inference failed for a frame: {e}")
+                results.append(None)
 
         return results[0] if single else results
