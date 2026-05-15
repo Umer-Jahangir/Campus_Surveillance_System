@@ -1,35 +1,50 @@
 """
-dashboard_server.py
-===================
-Flask + Socket.IO bridge that runs the OpenVINO multi-stream pipeline and
-streams annotated JPEG frames, detection events, behavior alerts, and
-performance stats to the browser dashboard in real time.
+dashboard_server.py  (v2 – production-grade)
+=============================================
+Changes from optimised v1
+--------------------------
+P1  Frames are NEVER passed through multiprocessing.Queue.
+    The queue carries only lightweight metadata tuples.
+    Frames are read directly from shared memory inside the dashboard process.
 
-No cv2.imshow — all video output is in the browser.
+P2  Base64 frame transport over Socket.IO is eliminated entirely.
+    Socket.IO now emits ONLY metadata (boxes, track_ids, activities, alerts).
 
-Usage:
-    python main.py
-Then open http://localhost:5000
+P3  Server-side frame annotation (annotate_frame / cv2.putText) is removed.
+    The browser overlays bounding boxes on a <canvas> element instead.
+
+P4  Video is delivered via MJPEG HTTP streaming (/video_feed/<stream_id>).
+    One persistent HTTP connection per stream; no WebSocket frame overhead.
+    Browser: <img src="/video_feed/0"> + <canvas> overlay.
+
+P5  Shared-memory double-buffering is synchronised with a per-stream
+    multiprocessing.Value('i') that records the active buffer index.
+    The dashboard reads whichever buffer the writer last committed to,
+    eliminating frame tearing from a partially-written buffer.
+    Worker contract: write frame → then atomically set active_buf_idx.value.
+
+P6  Queue drain uses a bounded try/except Empty loop instead of qsize().
+    qsize() is unreliable on macOS and some Linux configurations.
+
+P7  Workers should check result_queue.full() and DROP the frame rather than
+    block, keeping the queue shallow.  Enforced in worker.py (not here).
 """
 
-import base64
+import collections
 import ctypes
-import json
 import multiprocessing
 import multiprocessing.shared_memory
-import os
-import sys
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Empty
 
 import cv2
 import numpy as np
 import psutil
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_socketio import SocketIO
 
-# ── project imports ────────────────────────────────────────────────────────
 from worker import decoder_worker, inference_worker
 from monitor import monitor_worker
 from utils import compute_fps, summarize_latency
@@ -40,13 +55,28 @@ app.config["SECRET_KEY"] = "ov-dashboard-secret-2025"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
                     logger=False, engineio_logger=False)
 
-# ── frame / pipeline constants ─────────────────────────────────────────────
+# ── constants ──────────────────────────────────────────────────────────────
 FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS = 256, 320, 3
 FRAME_SHAPE  = (FRAME_HEIGHT, FRAME_WIDTH, FRAME_CHANNELS)
 FRAME_SIZE   = FRAME_HEIGHT * FRAME_WIDTH * FRAME_CHANNELS
 JPEG_QUALITY = 70
-MAX_ALERTS          = 200   # rolling detection alert history
-MAX_BEHAVIOR_ALERTS = 200   # rolling behavior alert history
+MAX_ALERTS          = 200
+MAX_BEHAVIOR_ALERTS = 200
+DRAIN_LIMIT         = 256    # upper cap on metadata msgs pulled per tick
+SYS_EMIT_INTERVAL   = 0.5   # seconds between system_stats broadcasts
+LOOP_SLEEP          = 0.012  # seconds
+MJPEG_BOUNDARY      = b"--mjpegframe"
+
+# ── module-level thread pool for parallel JPEG encoding ───────────────────
+# Used exclusively for the MJPEG path — NOT for Socket.IO (P2).
+_encode_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="jpeg-enc")
+
+# ── MJPEG frame store ─────────────────────────────────────────────────────
+# Latest encoded JPEG bytes per stream_id.  Protected by _mjpeg_lock.
+# Emit-loop writes; _mjpeg_generator threads read.
+_mjpeg_frames: dict[int, bytes]           = {}
+_mjpeg_events: dict[int, threading.Event] = {}  # signalled on new frame
+_mjpeg_lock = threading.Lock()
 
 # ── global state ───────────────────────────────────────────────────────────
 _lock = threading.Lock()
@@ -66,14 +96,14 @@ state = {
     "shared_ram":        None,
     "shm_objects":       [],
     "shm_names":         [],
+    "active_buf_idxs":   [],   # P5: per-stream multiprocessing.Value('i')
     "stats":             {},
 }
 
-# rolling alert lists
 alerts:          list = []
 behavior_alerts: list = []
-alert_lock           = threading.Lock()
-behavior_alert_lock  = threading.Lock()
+alert_lock          = threading.Lock()
+behavior_alert_lock = threading.Lock()
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -87,31 +117,39 @@ def compute_cores_per_decoder(num_streams: int) -> int:
     return per
 
 
-def annotate_frame(frame: np.ndarray, boxes, track_ids,
-                   labels, confs) -> np.ndarray:
-    """Draw bounding boxes + labels on a copy of frame."""
-    out = frame.copy()
-    if boxes is None:
-        return out
-    for bi, box in enumerate(boxes):
-        x1, y1, x2, y2 = map(int, box)
-        tid  = int(track_ids[bi]) if track_ids is not None else -1
-        lbl  = labels[bi] if labels else "?"
-        conf = float(confs[bi]) if confs is not None else 0.0
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 80), 2)
-        tag = f"{lbl} {conf:.2f} #{tid}"
-        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-        cv2.rectangle(out, (x1, max(y1-th-6, 0)),
-                      (x1+tw+4, y1), (0, 255, 80), -1)
-        cv2.putText(out, tag, (x1+2, max(y1-4, th)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1)
-    return out
+def _read_frame_from_shm(stream_idx: int) -> "np.ndarray | None":
+    """
+    P1 / P5: Read the latest committed frame directly from shared memory.
+
+    Uses active_buf_idxs[stream_idx].value (0 or 1) to pick the buffer
+    the writer last finished writing, preventing half-written frame reads.
+    Returns a *copy* so the shared buffer is immediately reusable.
+    """
+    with _lock:
+        shm_objects = state["shm_objects"]
+        active_bufs = state["active_buf_idxs"]
+        if stream_idx >= len(shm_objects) or stream_idx >= len(active_bufs):
+            return None
+        sa, sb  = shm_objects[stream_idx]
+        buf_idx = active_bufs[stream_idx].value   # atomic read
+        shm     = sa if buf_idx == 0 else sb
+
+    arr = np.ndarray(FRAME_SHAPE, dtype=np.uint8, buffer=shm.buf)
+    return arr.copy()   # copy before lock / shm reference is released
 
 
-def frame_to_b64(frame: np.ndarray) -> str:
+def _encode_stream_jpeg(stream_idx: int) -> "bytes | None":
+    """
+    P4: Grab the latest shared-memory frame for stream_idx and JPEG-encode
+    it.  Runs inside _encode_pool — imencode releases the GIL, so multiple
+    streams encode concurrently.
+    """
+    frame = _read_frame_from_shm(stream_idx)
+    if frame is None:
+        return None
     _, buf = cv2.imencode(".jpg", frame,
                           [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    return base64.b64encode(buf).decode("utf-8")
+    return bytes(buf)
 
 
 def _stats_snapshot(s: dict) -> dict:
@@ -138,165 +176,247 @@ def _stats_snapshot(s: dict) -> dict:
     }
 
 
-# ── emit loop ──────────────────────────────────────────────────────────────
+# ── MJPEG streaming ────────────────────────────────────────────────────────
 
-def _emit_loop():
+def _mjpeg_generator(stream_id: int):
     """
-    Runs in a daemon thread.  Drains result_queue, encodes frames as JPEG,
-    and emits Socket.IO events to all connected browsers.
+    P4: Infinite multipart generator for /video_feed/<stream_id>.
 
-    Result tuple layout (12 fields):
-        [0]  "frame"
-        [1]  stream_id
-        [2]  frame  (np.ndarray)
-        [3]  boxes
-        [4]  track_ids
-        [5]  classes
-        [6]  confs
-        [7]  labels
-        [8]  capture_timestamp
-        [9]  per_frame_ms
-        [10] e2e_lat
-        [11] behavior_alerts  ← list of behavior dicts (NEW)
+    Blocks on a per-stream threading.Event until the emit-loop deposits a
+    new JPEG, then yields the multipart chunk.  One persistent HTTP
+    connection per browser tab; zero WebSocket overhead for raw video.
     """
-    last_sys_emit = time.monotonic()
+    # Ensure an event exists before entering the loop.
+    with _mjpeg_lock:
+        if stream_id not in _mjpeg_events:
+            _mjpeg_events[stream_id] = threading.Event()
+    evt = _mjpeg_events[stream_id]
 
     while True:
         with _lock:
             running = state["running"]
-            rq      = state["result_queue"]
-            stop_ev = state["stop_event"]
+        if not running:
+            break
 
-        if not running or rq is None:
+        signalled = evt.wait(timeout=1.0)
+        if not signalled:
+            continue   # pipeline paused or not yet started
+        evt.clear()
+
+        with _mjpeg_lock:
+            jpeg = _mjpeg_frames.get(stream_id)
+        if jpeg is None:
+            continue
+
+        yield (
+            MJPEG_BOUNDARY + b"\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+            + jpeg + b"\r\n"
+        )
+
+
+@app.route("/video_feed/<int:stream_id>")
+def video_feed(stream_id: int):
+    """
+    P4: MJPEG HTTP endpoint.
+    Browser usage: <img src="/video_feed/0">
+    Overlay bounding boxes on a <canvas> element using Socket.IO metadata.
+    """
+    return Response(
+        _mjpeg_generator(stream_id),
+        mimetype="multipart/x-mixed-replace; boundary=mjpegframe",
+    )
+
+
+# ── emit loop ──────────────────────────────────────────────────────────────
+
+def _emit_loop() -> None:
+    """
+    Daemon thread: drains result_queue for METADATA ONLY (no frame arrays),
+    reads frames from shared memory, encodes JPEG for MJPEG clients, and
+    emits lightweight Socket.IO metadata events.
+
+    Key differences from v1
+    -----------------------
+    * No numpy frame array is unpickled from the queue (P1).
+      Frame arrays in messages are accepted for backward compat but discarded.
+    * No JPEG encoding on the Socket.IO path — only MJPEG path encodes (P2).
+    * annotate_frame() removed entirely — browser canvas does it (P3).
+    * Queue drain uses bounded try/except Empty, not qsize() (P6).
+    * Socket.IO 'frame_meta' payload: boxes + track_ids + activities, no image.
+    """
+    last_sys_emit = time.monotonic()
+
+    while True:
+        # ── snapshot shared state ONCE per tick ───────────────────────────
+        with _lock:
+            running   = state["running"]
+            rq        = state["result_queue"]
+            stop_ev   = state["stop_event"]
+            stats_ref = state["stats"]
+            streams   = state["streams"]
+
+        if not running or rq is None or (stop_ev and stop_ev.is_set()):
             time.sleep(0.05)
             continue
 
-        if stop_ev and stop_ev.is_set():
-            time.sleep(0.1)
-            continue
+        # Streams that received new metadata this tick → need a fresh JPEG.
+        updated_streams: set[int]     = set()
+        latest_meta: dict[int, dict]  = {}
+        pending_behavior: list[tuple] = []
 
-        # ── drain result queue ────────────────────────────────────────────
-        try:
-            for _ in range(48):
+        # ── P6: bounded drain with try/except — portable, no qsize() ─────
+        for _ in range(DRAIN_LIMIT):
+            try:
                 msg = rq.get_nowait()
-                if msg[0] != "frame":
-                    continue
+            except Empty:
+                break
 
-                # Unpack — support both old 11-field and new 12-field tuples
-                if len(msg) == 12:
-                    (_, idx, frame, boxes, track_ids, classes, confs, labels,
-                     capture_time, model_lat, e2e_lat, b_alerts) = msg
-                else:
-                    (_, idx, frame, boxes, track_ids, classes, confs, labels,
-                     capture_time, model_lat, e2e_lat) = msg
-                    b_alerts = []
+            if msg[0] != "frame":
+                continue
 
-                with _lock:
-                    s = state["stats"].get(idx)
-                if s is None:
-                    continue
+            # ── Unpack result message ──────────────────────────────────────
+            #
+            # worker.py (current, frameless) sends a 12-element tuple:
+            #   ("frame", stream_id, boxes, track_ids, classes, confs,
+            #    labels, timestamp, per_frame_ms, e2e_lat,
+            #    behavior_alerts, activities)
+            #
+            # Legacy workers (with _frame at index 2) sent 13-14 elements.
+            # Distinguish purely by length.
+            #
+            if len(msg) >= 14:
+                # Legacy 14+: _frame at index 2, activities at index 13
+                (_, idx, _frame, boxes, track_ids, classes, confs, labels,
+                 capture_time, model_lat, e2e_lat, b_alerts,
+                 per_person_activities) = msg[:14]
 
-                # ── update stats ──────────────────────────────────────────
-                now_t = time.perf_counter()
-                if s["start_time"] is None:
-                    s["start_time"] = capture_time
-                s["end_time"] = capture_time
-                s["frames"]  += 1
+            elif len(msg) == 13:
+                # Legacy 13: _frame at index 2, no activities
+                (_, idx, _frame, boxes, track_ids, classes, confs, labels,
+                 capture_time, model_lat, e2e_lat, b_alerts, _act) = msg
+                per_person_activities = {}
 
-                if len(s["model_latencies"]) >= 1000:
-                    s["model_latencies"].pop(0)
-                s["model_latencies"].append(model_lat)
+            elif len(msg) == 12:
+                # Current worker.py — NO _frame field:
+                # ("frame", stream_id, boxes, track_ids, classes, confs,
+                #  labels, timestamp, per_frame_ms, e2e_lat,
+                #  behavior_alerts, activities)
+                (_, idx, boxes, track_ids, classes, confs, labels,
+                 capture_time, model_lat, e2e_lat,
+                 b_alerts, per_person_activities) = msg
 
-                if len(s["pipeline_latencies"]) >= 1000:
-                    s["pipeline_latencies"].pop(0)
-                s["pipeline_latencies"].append(e2e_lat)
+            else:
+                # Minimal legacy 11: _frame at index 2, no alerts
+                (_, idx, _frame, boxes, track_ids, classes, confs, labels,
+                 capture_time, model_lat, e2e_lat) = msg
+                b_alerts, per_person_activities = [], {}
 
-                elapsed = now_t - s["last_fps_time"]
-                if elapsed >= 1.0:
-                    s["live_fps"]         = (s["frames"] - s["last_fps_frames"]) / elapsed
-                    s["last_fps_time"]    = now_t
-                    s["last_fps_frames"]  = s["frames"]
+            s = stats_ref.get(idx)
+            if s is None:
+                continue
 
-                # ── build detection payload ───────────────────────────────
-                det_list = []
-                if boxes is not None and len(boxes):
-                    for bi in range(len(boxes)):
-                        det_list.append({
-                            "label":    labels[bi] if labels else "object",
-                            "conf":     round(float(confs[bi]), 3)
-                                        if confs is not None else 0.0,
-                            "track_id": int(track_ids[bi])
-                                        if track_ids is not None else -1,
-                            "box":      [int(v) for v in boxes[bi]],
-                        })
+            # ── update stats (emit-loop is sole writer — no lock needed) ──
+            now_t = time.perf_counter()
+            if s["start_time"] is None:
+                s["start_time"] = capture_time
+            s["end_time"] = capture_time
+            s["frames"]  += 1
+            s["model_latencies"].append(model_lat)
+            s["pipeline_latencies"].append(e2e_lat)
 
-                    with alert_lock:
-                        stream_label = (state["streams"][idx]["label"]
-                                        if idx < len(state["streams"])
-                                        else f"S{idx}")
-                        for d in det_list:
-                            alerts.append({
-                                "stream_id":    idx,
-                                "stream_label": stream_label,
-                                "label":        d["label"],
-                                "conf":         d["conf"],
-                                "track_id":     d["track_id"],
-                                "ts":           time.time(),
-                            })
-                        del alerts[:max(0, len(alerts) - MAX_ALERTS)]
+            elapsed = now_t - s["last_fps_time"]
+            if elapsed >= 1.0:
+                s["live_fps"]        = (s["frames"] - s["last_fps_frames"]) / elapsed
+                s["last_fps_time"]   = now_t
+                s["last_fps_frames"] = s["frames"]
 
-                # ── annotate + encode frame ───────────────────────────────
-                annotated = annotate_frame(frame, boxes, track_ids,
-                                           labels, confs)
-                b64 = frame_to_b64(annotated)
+                if now_t - s["last_log_time"] >= 5.0:
+                    m_avg, m_p95, m_max = summarize_latency(s["model_latencies"])
+                    p_avg, p_p95, p_max = summarize_latency(s["pipeline_latencies"])
+                    print(
+                        f"[Benchmark][Stream {idx}] "
+                        f"fps={s['live_fps']:.1f} frames={s['frames']} "
+                        f"dropped={s.get('dropped', 0)} "
+                        f"model_avg={m_avg:.1f} p95={m_p95:.1f} max={m_max:.1f} "
+                        f"e2e_avg={p_avg:.1f} p95={p_p95:.1f} max={p_max:.1f}"
+                    )
+                    s["last_log_time"] = now_t
 
-                socketio.emit("frame_update", {
-                    "stream_id":  idx,
-                    "frame":      b64,
-                    "detections": det_list,
-                    "stats":      _stats_snapshot(s),
-                })
+            updated_streams.add(idx)
 
-                if det_list:
-                    socketio.emit("detection_alert", {
-                        "stream_id":    idx,
-                        "stream_label": (state["streams"][idx]["label"]
-                                         if idx < len(state["streams"])
-                                         else f"S{idx}"),
-                        "detections":   det_list,
-                        "ts":           time.time(),
-                    })
+            # P2 / P3: metadata-only payload — NO image bytes, NO annotation.
+            latest_meta[idx] = {
+                "stream_id":    idx,
+                "boxes":        boxes.tolist() if hasattr(boxes, "tolist") else (boxes or []),
+                "track_ids":    track_ids.tolist() if hasattr(track_ids, "tolist") else (track_ids or []),
+                "activities":   per_person_activities or {},
+                "person_count": len(per_person_activities) if per_person_activities else 0,
+                "stats":        _stats_snapshot(s),
+            }
 
-                # ── behavior alerts ───────────────────────────────────────
-                if b_alerts:
-                    stream_label = (state["streams"][idx]["label"]
-                                    if idx < len(state["streams"])
-                                    else f"S{idx}")
+            if b_alerts:
+                fight_alerts = [
+                    ba for ba in b_alerts
+                    if ba.get("label") == "fight" or ba.get("type") == "fight"
+                ]
+                if fight_alerts:
+                    stream_label = (
+                        streams[idx]["label"]
+                        if idx < len(streams) else f"S{idx}"
+                    )
+                    pending_behavior.append((idx, stream_label, fight_alerts))
 
-                    with behavior_alert_lock:
-                        for ba in b_alerts:
-                            behavior_alerts.append({
-                                "stream_id":    idx,
-                                "stream_label": stream_label,
-                                **ba,
-                            })
-                        del behavior_alerts[
-                            :max(0, len(behavior_alerts) - MAX_BEHAVIOR_ALERTS)
-                        ]
+        # ── P1 / P4: encode fresh JPEG from shared memory for MJPEG store ─
+        # Submitted to the thread pool so N streams encode concurrently.
+        # imencode releases the GIL → true parallelism even under CPython.
+        if updated_streams:
+            futures = {
+                _encode_pool.submit(_encode_stream_jpeg, idx): idx
+                for idx in updated_streams
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    jpeg = fut.result()
+                    if jpeg:
+                        with _mjpeg_lock:
+                            _mjpeg_frames[idx] = jpeg
+                            if idx not in _mjpeg_events:
+                                _mjpeg_events[idx] = threading.Event()
+                            _mjpeg_events[idx].set()   # wake MJPEG generator
+                except Exception as exc:
+                    print(f"[emit-loop] shm encode error stream {idx}: {exc}")
 
-                    socketio.emit("behavior_alert", {
+        # ── P2 / P3: emit metadata-only Socket.IO events ──────────────────
+        # 'frame_meta' replaces the old 'frame_update' that carried b64 JPEG.
+        # Frontend listens on 'frame_meta' and draws boxes on <canvas>.
+        for meta_payload in latest_meta.values():
+            socketio.emit("frame_meta", meta_payload)
+
+        # ── behavior alerts ────────────────────────────────────────────────
+        for idx, stream_label, fight_alerts in pending_behavior:
+            with behavior_alert_lock:
+                for ba in fight_alerts:
+                    behavior_alerts.append({
                         "stream_id":    idx,
                         "stream_label": stream_label,
-                        "alerts":       b_alerts,
-                        "ts":           time.time(),
+                        **ba,
                     })
+                del behavior_alerts[
+                    :max(0, len(behavior_alerts) - MAX_BEHAVIOR_ALERTS)
+                ]
+            socketio.emit("behavior_alert", {
+                "stream_id":    idx,
+                "stream_label": stream_label,
+                "alerts":       fight_alerts,
+                "ts":           time.time(),
+            })
 
-        except Empty:
-            pass
-
-        # ── system stats (every 0.5 s) ────────────────────────────────────
+        # ── system stats (throttled) ───────────────────────────────────────
         now_mono = time.monotonic()
-        if now_mono - last_sys_emit >= 0.5:
+        if now_mono - last_sys_emit >= SYS_EMIT_INTERVAL:
             with _lock:
                 cpu = state["shared_cpu"].value if state["shared_cpu"] else 0.0
                 ram = state["shared_ram"].value if state["shared_ram"] else 0.0
@@ -306,7 +426,7 @@ def _emit_loop():
             })
             last_sys_emit = now_mono
 
-        time.sleep(0.012)
+        time.sleep(LOOP_SLEEP)
 
 
 threading.Thread(target=_emit_loop, daemon=True, name="emit-loop").start()
@@ -315,6 +435,7 @@ threading.Thread(target=_emit_loop, daemon=True, name="emit-loop").start()
 # ── pipeline lifecycle ─────────────────────────────────────────────────────
 
 def _start_pipeline(streams: list) -> None:
+    """Allocate shared memory, spawn workers, initialise per-stream stats."""
     num_streams = len(streams)
     stream_urls = [s["url"] for s in streams]
     cpp         = compute_cores_per_decoder(num_streams)
@@ -323,15 +444,19 @@ def _start_pipeline(streams: list) -> None:
     inference_alive = multiprocessing.Event()
 
     shm_objects, shm_names = [], []
+    # P5: one active-buffer-index Value per stream.
+    # Worker writes frame to the inactive buffer, then sets value → the
+    # dashboard always reads the last fully committed buffer.
+    active_buf_idxs: list[multiprocessing.Value] = []
+
     for _ in range(num_streams):
-        sa = multiprocessing.shared_memory.SharedMemory(
-            create=True, size=FRAME_SIZE)
-        sb = multiprocessing.shared_memory.SharedMemory(
-            create=True, size=FRAME_SIZE)
+        sa = multiprocessing.shared_memory.SharedMemory(create=True, size=FRAME_SIZE)
+        sb = multiprocessing.shared_memory.SharedMemory(create=True, size=FRAME_SIZE)
         shm_objects.append((sa, sb))
         shm_names.append((sa.name, sb.name))
+        active_buf_idxs.append(multiprocessing.Value('i', 0))   # P5
 
-    meta_queues  = [multiprocessing.Queue(maxsize=8) for _ in range(num_streams)]
+    meta_queues  = [multiprocessing.Queue(maxsize=8)   for _ in range(num_streams)]
     result_queue = multiprocessing.Queue(maxsize=512)
     shared_cpu   = multiprocessing.Value('d', 0.0)
     shared_ram   = multiprocessing.Value('d', 0.0)
@@ -348,7 +473,7 @@ def _start_pipeline(streams: list) -> None:
     for i, url in enumerate(stream_urls):
         p = multiprocessing.Process(
             target=decoder_worker,
-            args=(i, url, shm_names[i], FRAME_SHAPE,
+            args=(i, url, shm_names[i], active_buf_idxs[i], FRAME_SHAPE,
                   meta_queues[i], stop_event, inference_alive,
                   num_streams, cpp),
         )
@@ -357,19 +482,30 @@ def _start_pipeline(streams: list) -> None:
 
     mon_proc = multiprocessing.Process(
         target=monitor_worker,
-        args=(shared_cpu, shared_ram, stop_event)
+        args=(shared_cpu, shared_ram, stop_event),
     )
     mon_proc.start()
 
     per_stream_stats = {}
     for i in range(num_streams):
         per_stream_stats[i] = {
-            "frames": 0, "dropped": 0,
-            "model_latencies": [], "pipeline_latencies": [],
-            "start_time": None, "end_time": None,
-            "last_fps_time": time.perf_counter(),
-            "last_fps_frames": 0, "live_fps": 0.0,
+            "frames":  0,
+            "dropped": 0,
+            "model_latencies":    collections.deque(maxlen=1000),
+            "pipeline_latencies": collections.deque(maxlen=1000),
+            "start_time":      None,
+            "end_time":        None,
+            "last_fps_time":   time.perf_counter(),
+            "last_fps_frames": 0,
+            "live_fps":        0.0,
+            "last_log_time":   time.perf_counter(),
+            "activity":        "no-person",
         }
+
+    # Clear MJPEG store for the new session.
+    with _mjpeg_lock:
+        _mjpeg_frames.clear()
+        _mjpeg_events.clear()
 
     state.update({
         "running":         True,
@@ -385,18 +521,22 @@ def _start_pipeline(streams: list) -> None:
         "shared_ram":      shared_ram,
         "shm_objects":     shm_objects,
         "shm_names":       shm_names,
+        "active_buf_idxs": active_buf_idxs,   # P5
         "stats":           per_stream_stats,
     })
 
 
 def _stop_pipeline() -> None:
+    """Terminate all worker processes and release shared memory."""
     if not state["running"]:
         return
 
     state["stop_event"].set()
 
-    all_procs = (state["decoder_procs"]
-                 + [state["inference_proc"], state["monitor_proc"]])
+    all_procs = (
+        state["decoder_procs"]
+        + [state["inference_proc"], state["monitor_proc"]]
+    )
     for p in all_procs:
         if not p:
             continue
@@ -410,10 +550,21 @@ def _stop_pipeline() -> None:
 
     for sa, sb in state["shm_objects"]:
         for shm in (sa, sb):
-            try: shm.close()
-            except Exception: pass
-            try: shm.unlink()
-            except Exception: pass
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except Exception:
+                pass
+
+    # Wake any blocked MJPEG generators so their threads can exit cleanly.
+    with _mjpeg_lock:
+        _mjpeg_frames.clear()
+        for evt in _mjpeg_events.values():
+            evt.set()
+        _mjpeg_events.clear()
 
     state.update({
         "running": False, "restarting": False,
@@ -422,15 +573,45 @@ def _stop_pipeline() -> None:
         "meta_queues": [], "result_queue": None,
         "shared_cpu": None, "shared_ram": None,
         "shm_objects": [], "shm_names": [],
+        "active_buf_idxs": [],
         "stats": {},
     })
 
 
+def _hot_restart_bg(streams: list) -> None:
+    """
+    Stop the current pipeline and start a new one with the given stream list.
+    Runs in a background daemon thread so the calling REST handler returns
+    immediately instead of blocking for the full join-timeout chain.
+    """
+    with _lock:
+        state["restarting"] = True
+
+    socketio.emit("pipeline_status", {
+        "running": False, "restarting": True, "num_streams": len(streams)
+    })
+
+    with _lock:
+        _stop_pipeline()
+        if streams:
+            _start_pipeline(streams)
+        state["restarting"] = False
+
+    socketio.emit("pipeline_status", {
+        "running":     bool(streams),
+        "restarting":  False,
+        "num_streams": len(streams),
+    })
+
+
 def _hot_restart(streams: list) -> None:
-    state["restarting"] = True
-    _stop_pipeline()
-    if streams:
-        _start_pipeline(streams)
+    """Spawn a daemon thread to handle stop+restart without blocking callers."""
+    threading.Thread(
+        target=_hot_restart_bg,
+        args=(streams,),
+        daemon=True,
+        name="hot-restart",
+    ).start()
 
 
 # ── REST endpoints ─────────────────────────────────────────────────────────
@@ -454,8 +635,10 @@ def api_status():
 @app.route("/api/streams", methods=["GET"])
 def api_get_streams():
     with _lock:
-        return jsonify({"streams": state["streams"],
-                        "running": state["running"]})
+        return jsonify({
+            "streams": state["streams"],
+            "running": state["running"],
+        })
 
 
 @app.route("/api/streams", methods=["POST"])
@@ -463,7 +646,7 @@ def api_add_stream():
     data  = request.get_json(silent=True) or {}
     url   = (data.get("url") or "").strip()
     label = (data.get("label") or
-             f"Stream {len(state['streams'])+1}").strip()
+             f"Stream {len(state['streams']) + 1}").strip()
     if not url:
         return jsonify({"error": "url is required"}), 400
 
@@ -471,21 +654,12 @@ def api_add_stream():
         was_running = state["running"]
         state["streams"].append({"url": url, "label": label})
         snap = list(state["streams"])
-        if was_running:
-            socketio.emit("pipeline_status", {
-                "running": False, "restarting": True,
-                "num_streams": len(snap)
-            })
-            _hot_restart(snap)
 
     socketio.emit("streams_changed", {"streams": snap})
     if was_running:
-        socketio.emit("pipeline_status", {
-            "running": True, "restarting": False,
-            "num_streams": len(snap)
-        })
-    return jsonify({"ok": True, "streams": snap,
-                    "restarted": was_running}), 201
+        _hot_restart(snap)
+
+    return jsonify({"ok": True, "streams": snap, "restarted": was_running}), 201
 
 
 @app.route("/api/streams/<int:idx>", methods=["DELETE"])
@@ -496,22 +670,11 @@ def api_remove_stream(idx: int):
         was_running = state["running"]
         state["streams"].pop(idx)
         snap = list(state["streams"])
-        if was_running:
-            socketio.emit("pipeline_status", {
-                "running": False, "restarting": True,
-                "num_streams": len(snap)
-            })
-            if snap:
-                _hot_restart(snap)
-            else:
-                _stop_pipeline()
 
     socketio.emit("streams_changed", {"streams": snap})
     if was_running:
-        socketio.emit("pipeline_status", {
-            "running": bool(snap), "restarting": False,
-            "num_streams": len(snap)
-        })
+        _hot_restart(snap)
+
     return jsonify({"ok": True, "streams": snap, "restarted": was_running})
 
 
@@ -522,22 +685,16 @@ def api_update_stream(idx: int):
         if not (0 <= idx < len(state["streams"])):
             return jsonify({"error": "Index out of range"}), 404
         was_running = state["running"]
-        if "url"   in data: state["streams"][idx]["url"]   = data["url"].strip()
-        if "label" in data: state["streams"][idx]["label"] = data["label"].strip()
+        if "url"   in data:
+            state["streams"][idx]["url"]   = data["url"].strip()
+        if "label" in data:
+            state["streams"][idx]["label"] = data["label"].strip()
         snap = list(state["streams"])
-        if was_running and "url" in data:
-            socketio.emit("pipeline_status", {
-                "running": False, "restarting": True,
-                "num_streams": len(snap)
-            })
-            _hot_restart(snap)
 
     socketio.emit("streams_changed", {"streams": snap})
     if was_running and "url" in data:
-        socketio.emit("pipeline_status", {
-            "running": True, "restarting": False,
-            "num_streams": len(snap)
-        })
+        _hot_restart(snap)
+
     return jsonify({"ok": True, "streams": snap})
 
 
@@ -550,8 +707,9 @@ def api_start():
             return jsonify({"error": "Add at least one stream first"}), 400
         _start_pipeline(state["streams"])
     socketio.emit("pipeline_status", {
-        "running": True, "restarting": False,
-        "num_streams": len(state["streams"])
+        "running":     True,
+        "restarting":  False,
+        "num_streams": len(state["streams"]),
     })
     return jsonify({"ok": True})
 
@@ -569,9 +727,10 @@ def api_alerts():
     limit     = int(request.args.get("limit", 100))
     stream_id = request.args.get("stream_id")
     with alert_lock:
-        filtered = ([a for a in alerts
-                     if str(a["stream_id"]) == str(stream_id)]
-                    if stream_id is not None else list(alerts))
+        filtered = (
+            [a for a in alerts if str(a["stream_id"]) == str(stream_id)]
+            if stream_id is not None else list(alerts)
+        )
         recent = list(reversed(filtered[-limit:]))
     return jsonify({"alerts": recent, "total": len(filtered)})
 
@@ -581,9 +740,11 @@ def api_behavior_alerts():
     limit     = int(request.args.get("limit", 100))
     stream_id = request.args.get("stream_id")
     with behavior_alert_lock:
-        filtered = ([a for a in behavior_alerts
-                     if str(a["stream_id"]) == str(stream_id)]
-                    if stream_id is not None else list(behavior_alerts))
+        filtered = (
+            [a for a in behavior_alerts
+             if str(a["stream_id"]) == str(stream_id)]
+            if stream_id is not None else list(behavior_alerts)
+        )
         recent = list(reversed(filtered[-limit:]))
     return jsonify({"alerts": recent, "total": len(filtered)})
 
@@ -610,15 +771,15 @@ def api_clear_alerts():
 @socketio.on("connect")
 def on_connect():
     with _lock:
-        emit_initial = {
+        initial = {
             "running":    state["running"],
             "restarting": state["restarting"],
             "streams":    state["streams"],
         }
-    socketio.emit("initial_state", emit_initial)
+    socketio.emit("initial_state", initial)
 
 
-# ── entry point ───────────────────────────────────────────────────────────
+# ── entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
@@ -629,7 +790,7 @@ if __name__ == "__main__":
         pass
 
     print("=" * 60)
-    print("  Campus Surveillance Dashboard (Pose Edition)")
+    print("  Campus Surveillance Dashboard")
     print("  http://localhost:5000")
     print("=" * 60)
 
@@ -639,6 +800,7 @@ if __name__ == "__main__":
     finally:
         with _lock:
             _stop_pipeline()
+        _encode_pool.shutdown(wait=False)
         try:
             ctypes.windll.winmm.timeEndPeriod(1)
         except Exception:
