@@ -17,7 +17,7 @@ del _det_psutil, _det_threads
 class Detector:
     """YOLOv8 pose + OpenVINO inference wrapper (per‑frame inference)."""
 
-    def __init__(self, model_path: str = "models/yolov8n-pose.pt",
+    def __init__(self, model_path: str = "models/yolov8n-pose_openvino_model",
                  imgsz: int = 320, confidence: float = 0.3,
                  warmup_iters: int = 1):
         """
