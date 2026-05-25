@@ -354,6 +354,10 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); heig
   .stream-card-body { aspect-ratio: 16/9; flex: unset; }
   .detail-body { grid-template-columns: 1fr; }
 }
+
+.bhvr-state.fight   { color: var(--danger); font-weight: 700; }
+.bhvr-chip.fight    { border-color: rgba(255,51,85,.5); background: rgba(255,51,85,.12); }
+.bhvr-chip.fight .bhvr-chip-label { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -461,6 +465,7 @@ const BEHAVIOR_ICONS = {
   loitering: '⚠️',
   sitting:   '🪑',
   crowd:     '🚨',
+  fight:     '🥊',
 };
 
 function behaviorIcon(label) {
@@ -907,8 +912,11 @@ function prependBehaviorDOM(stream_id, stream_label, ba, ts) {
   if (empty) empty.remove();
 
   const timeStr  = new Date(ts * 1000).toLocaleTimeString();
-  const icon     = behaviorIcon(ba.label);
-  const isCrowd  = ba.type === "crowd";
+  // Normalise: fight alerts use ba.type; legacy alerts use ba.label
+  const alertLabel = ba.label || ba.type || 'unknown';
+  const icon       = behaviorIcon(alertLabel);
+  const isCrowd    = alertLabel === 'crowd';
+  const isFight    = alertLabel === 'fight';
 
   const item = document.createElement("div");
   item.className = "bhvr-item";
@@ -916,10 +924,18 @@ function prependBehaviorDOM(stream_id, stream_label, ba, ts) {
   let line = '';
   if (isCrowd) {
     line = `<span class="bhvr-state crowd">Crowd detected — ${ba.count} people</span>`;
+  } else if (isFight) {
+    const ids    = Array.isArray(ba.track_ids) ? ba.track_ids
+                 : (ba.track_id != null ? [ba.track_id] : []);
+    const pct    = ba.confidence != null ? (ba.confidence * 100).toFixed(0) + '%' : '';
+    const idTags = ids.map(id => `<span class="bhvr-person-id">#${id}</span>`).join(' ');
+    line = `<span class="bhvr-state fight">🥊 FIGHT DETECTED</span>`
+         + ` <span style="color:var(--muted)">· persons </span>${idTags}`
+         + (pct ? ` <span style="color:var(--muted)">· conf <b style="color:var(--danger)">${pct}</b></span>` : '');
   } else {
-    line = `<span class="bhvr-person-id">Person #${ba.track_id}</span>
-            <span class="bhvr-arrow"> → </span>
-            <span class="bhvr-state ${ba.label}">${ba.label}</span>`;
+    line = `<span class="bhvr-person-id">Person #${ba.track_id}</span>`
+         + `<span class="bhvr-arrow"> → </span>`
+         + `<span class="bhvr-state ${alertLabel}">${alertLabel}</span>`;
   }
 
   item.innerHTML = `
