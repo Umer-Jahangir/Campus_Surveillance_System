@@ -38,10 +38,7 @@ The dashboard is started from `src/main.py`, and the core processing code is in 
 - `src/fight_detector_onnx.py` — per-person LSTM fight scoring
 - `src/pose_model.py` — helper script for exporting YOLOv8 models
 - `src/templates/dashboard.html` — dashboard UI
-- `src/models/` — OpenVINO model assets and metadata
-- `src/videos/` — test/reference video files
-- `logs/` — runtime logging output
-- `output/` — generated artifacts and outputs
+- `src/models/` — yolv8 OpenVINO and lstm model assets , metadata
 
 ---
 
@@ -126,6 +123,28 @@ python src/main.py
 ```text
 http://localhost:5000
 ```
+
+---
+
+## Detecting from Streams
+
+After the server is running, use the dashboard to add live sources for detection:
+
+- Add an RTSP camera stream URL, e.g. `rtsp://192.168.1.100:8554/cam1`
+- click on `start` button
+- The dashboard will start a decoder pipeline, perform pose detection, and overlay metadata in real time.
+
+### API stream registration
+
+You can also add streams programmatically via the server API:
+
+```bash
+curl -X POST http://localhost:5000/api/streams \
+  -H "Content-Type: application/json" \
+  -d '{"url": "rtsp://192.168.1.100:8554/cam1", "label": "Lobby"}'
+```
+
+The server supports RTSP and other OpenCV-compatible video sources.
 
 ---
 
