@@ -39,10 +39,6 @@ instance/
 /tmp/
 .ipynb_checkpoints/
 
-# Reproducibly downloaded scene weights; preserve local copies.
-# Existing tracked pose/legacy weights are unaffected.
-/src/models/final_x3d_realtime.pt
-
 # Useful validation logs accompany their result JSON.
 !/audit/validation-20260918/focused/*.log
 
