@@ -1,0 +1,11 @@
+{
+  "verified": false,
+  "model_sha256": "REPLACE_WITH_HASH_OF_VALIDATED_MODEL",
+  "keypoints": "coco17_xy",
+  "scope": "person",
+  "positive_label": "fight",
+  "coordinates": "inference_pixels",
+  "sample_fps": 30,
+  "max_gap_seconds": 0.5,
+  "note": "Illustrative schema only. Coordinates, sampling, class direction and normalization must come from training evidence before verified is set true."
+}

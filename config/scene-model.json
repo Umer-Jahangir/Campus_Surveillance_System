@@ -1,0 +1,18 @@
+{
+  "model": "visionlab-ai/school-violence-detection-models/final/final_x3d_realtime.pt",
+  "revision": "a744b6af7496f0cbfa4f0ba32acd46b65e52d4e1",
+  "sha256": "e833f69d110f167cad4a6c38d385564bdb2f6de63d246e45cb03ff9aa17f0349",
+  "reference_space_revision": "67d51a3743f276b96f87fa07d83d4ac5b9d326f8",
+  "license": "MIT (publisher declaration); PyTorchVideo Apache-2.0; YOLO separate AGPL-3.0",
+  "scope": "scene",
+  "labels": ["non-violent", "violent"],
+  "input": "float32 B,C,T,H,W; RGB; 16 uniformly indexed frames; 224x224 bilinear stretch",
+  "normalization": "divide by 255, subtract .45, divide by .225 per RGB channel",
+  "output": "model head softmax class 1; do not apply softmax a second time",
+  "deployment_window_seconds": 5,
+  "deployment_stride_seconds": 1,
+  "deployment_threshold": 0.5,
+  "deployment_confirmation_windows": 2,
+  "accuracy_validated": false,
+  "notes": "Five-second causal live windows are a deployment adaptation of uniformly sampled RWF clips. No participant attribution. Defaults not tuned on SF/NF/FF."
+}

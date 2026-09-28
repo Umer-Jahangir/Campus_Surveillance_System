@@ -1,0 +1,6 @@
+{
+  "clips": [
+    {"path": "videos/tuning.mp4", "source_id": "independent-source-A", "split": "tune", "fight_intervals": [[2.0, 4.0]]},
+    {"path": "videos/evaluation.mp4", "source_id": "independent-source-B", "split": "evaluation", "fight_intervals": []}
+  ]
+}
