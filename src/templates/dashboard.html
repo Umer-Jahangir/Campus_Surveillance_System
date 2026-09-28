@@ -127,7 +127,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); heig
 .stream-card-persons { font-family: var(--mono); font-size: 10px; color: var(--accent2); flex-shrink: 0; }
 .stream-card-fps    { font-family: var(--mono); font-size: 11px; color: var(--accent); font-weight: 700; flex-shrink: 0; }
 .stream-card-expand { font-size: 12px; color: var(--muted); background: none; border: none; cursor: pointer; padding: 2px 4px; border-radius: 3px; transition: color .15s; line-height: 1; flex-shrink: 0; }
-.stream-card-expand:hover { color: var(--accent2); }\n
+.stream-card-expand:hover { color: var(--accent2); }
 
 .stream-card-body { position: relative; width: 100%; flex: 1; min-height: 0; background: #000; overflow: hidden; }
 .stream-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; background: #000; }
@@ -373,7 +373,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); heig
     <div class="sys-metric"><span class="sys-metric-label">CPU</span><span class="sys-metric-value" id="sys-cpu">—</span></div>
     <div class="sys-metric"><span class="sys-metric-label">RAM</span><span class="sys-metric-value" id="sys-ram">—</span></div>
     <div class="sys-metric"><span class="sys-metric-label">Streams</span><span class="sys-metric-value" id="sys-streams">0</span></div>
-    <div class="sys-metric"><span class="sys-metric-label">Detections</span><span class="sys-metric-value" id="sys-dets">0</span></div>
+    <div class="sys-metric"><span class="sys-metric-label">Scene alert starts</span><span class="sys-metric-value" id="sys-dets">0</span></div>
   </div>
 </header>
 
@@ -483,100 +483,6 @@ function behaviorIcon(label) {
 //  activities: {track_id → label}, keys may be int or string.
 // ═══════════════════════════════════════════════════════
 
-const FRAME_W = 320, FRAME_H = 256;  // must match server FRAME_SHAPE
-
-// Returns the content rect of an object-fit:contain image inside a container.
-function letterboxTransform(canvasW, canvasH) {
-  const srcAspect = FRAME_W / FRAME_H;          // 320/256 = 1.25
-  const dstAspect = canvasW / canvasH;
-  let renderW, renderH;
-  if (srcAspect > dstAspect) {
-    renderW = canvasW;
-    renderH = canvasW / srcAspect;
-  } else {
-    renderH = canvasH;
-    renderW = canvasH * srcAspect;
-  }
-  return {
-    offsetX: (canvasW - renderW) / 2,
-    offsetY: (canvasH - renderH) / 2,
-    scaleX:  renderW / FRAME_W,
-    scaleY:  renderH / FRAME_H,
-  };
-}
-
-function drawBoxes(canvas, boxes, track_ids, activities) {
-  // Sync canvas pixel buffer to its CSS display size
-  const rect = canvas.getBoundingClientRect();
-  const dw = Math.round(rect.width)  || FRAME_W;
-  const dh = Math.round(rect.height) || FRAME_H;
-  if (canvas.width !== dw)  canvas.width  = dw;
-  if (canvas.height !== dh) canvas.height = dh;
-
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, dw, dh);
-  if (!boxes || !boxes.length) return;
-
-  const { offsetX, offsetY, scaleX, scaleY } = letterboxTransform(dw, dh);
-
-  function getActivity(tid) {
-    if (!activities || tid == null) return '';
-    const raw = activities[String(tid)] !== undefined
-                ? activities[String(tid)] : activities[tid];
-    if (!raw) return '';
-    if (typeof raw === 'string') return raw;
-    if (typeof raw === 'object') return raw.label || raw.activity || raw.state || '';
-    return '';
-  }
-
-  const fontSize = Math.max(9, Math.round(11 * Math.min(scaleX, scaleY)));
-  ctx.font = `bold ${fontSize}px "Space Mono", monospace`;
-
-  boxes.forEach((box, i) => {
-    const [x1, y1, x2, y2] = box;
-    const tid = track_ids && track_ids[i] != null ? track_ids[i] : null;
-    const act = getActivity(tid);
-
-    const color = act === 'loitering' ? '#ff6b35'
-                : act === 'running'   ? '#00e5a0'
-                : act === 'sitting'   ? '#00b8ff'
-                : act === 'walking'   ? '#facc15'
-                : act === 'fight'     ? '#ff3355'
-                : act === 'standing'  ? '#a855f7'
-                : '#a855f7';
-
-    // Map server coords → canvas coords via letterbox transform
-    const rx = offsetX + x1 * scaleX;
-    const ry = offsetY + y1 * scaleY;
-    const rw = (x2 - x1) * scaleX;
-    const rh = (y2 - y1) * scaleY;
-
-    // Box stroke
-    ctx.strokeStyle = color;
-    ctx.lineWidth   = 1.5;
-    ctx.strokeRect(rx, ry, rw, rh);
-
-    // Label: keep fully inside canvas
-    const label = tid != null ? `#${tid}${act ? ' ' + act : ''}` : (act || '');
-    if (!label) return;
-
-    const tw    = ctx.measureText(label).width;
-    const lh    = fontSize + 4;
-    // Prefer above the box; if no room flip below
-    const above = ry >= lh;
-    const lx    = Math.min(Math.max(0, rx), dw - tw - 8);
-    const ly    = above ? ry - 2 : ry + rh + lh;
-
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.roundRect(lx, ly - lh + 2, tw + 8, lh, 3);
-    ctx.fill();
-
-    ctx.fillStyle = '#080c10';
-    ctx.fillText(label, lx + 4, ly - 1);
-  });
-}
-
 // ═══════════════════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════════════════
@@ -587,6 +493,7 @@ const S = {
   alertCount: 0, maxAlerts: 200,
   bhvrCount: 0, maxBhvrAlerts: 200,
   lastDets: {}, detDirty: {},
+  lastFrameAt: {},
   lastBhvr: {},         // track_id → label  (per stream, used for card chips)
   crowdActive: {},      // stream_id → bool
 };
@@ -631,6 +538,7 @@ socket.on("initial_state", d => {
   }
 });
 socket.on("streams_changed", d => {
+  closeDetail(); S.lastBhvr = {}; S.streamStats = {};
   S.streams = d.streams||[]; renderSidebar(); renderGrid();
   setText("sys-streams", S.streams.length);
   // P4: reconnect MJPEG streams if running
@@ -642,17 +550,21 @@ socket.on("streams_changed", d => {
   }
 });
 socket.on("pipeline_status", d => {
+  if (d.error) { toast(d.error, "error"); setText("status-text", d.error); }
   S.running = d.running; S.restarting = d.restarting||false;
   applyPipelineState(); syncButtons();
   if (d.running && !d.restarting) {
+    S.lastBhvr = {}; S.lastFrameAt = {};
+    if (detailStreamId !== null) paintDetailFrame();
     // P4: connect MJPEG streams now that pipeline is live
     S.streams.forEach((_, i) => {
       const img = document.getElementById(`mjpeg-${i}`);
-      if (img && !img.src.includes('/video_feed/')) img.src = `/video_feed/${i}`;
+      if (img) img.src = `/video_feed/${i}?run=${Date.now()}`;
     });
     renderSidebar();
   }
-  if (!d.running && !d.restarting) {
+  if (!d.running) {
+    S.lastBhvr = {};
     // Stop MJPEG streams and clear overlays
     document.querySelectorAll("[id^='mjpeg-']").forEach(img => { img.src = ''; });
     document.querySelectorAll(".stream-overlay").forEach(el => el.classList.remove("hidden"));
@@ -666,26 +578,41 @@ socket.on("pipeline_status", d => {
   }
 });
 
-// P2/P3: frame_meta — metadata only, video via MJPEG /video_feed/<id>.
+// Annotations are embedded in the inferred MJPEG frame. Metadata is for statistics only.
 // Canvas pixel size fixed at FRAME_W×FRAME_H (320×256); CSS scales display.
 socket.on("frame_meta", d => {
   const { stream_id, boxes, track_ids, activities, person_count, stats } = d;
+  S.sourceInfo=S.sourceInfo || {};
+  S.sourceInfo[stream_id]={kind:d.source_kind,complete:d.total_frames>0 && d.frame_id+1>=d.total_frames};
+  S.lastFrameAt[stream_id] = d.published_at ? d.published_at * 1000 : Date.now();
+  setText(`cstate-${stream_id}`, d.source_kind==='offline' ? 'Offline analysis' : 'Live');
   S.streamStats[stream_id] = stats;
-  S.streamStats[stream_id] = stats;
+  const action=d.scene_action || {state:'unavailable',reason:'No scene model metadata'};
+  const actionNames={unavailable:'Unavailable',warming_up:'Warming up',active:'Active · analyzing video',suspected_fight:'Suspected fight · review scene'};
+  let actionText=`${action.model || 'Action model'} · ${actionNames[action.state] || action.state}`;
+  actionText=`${d.mode==='scene_only' ? 'Scene only · person inference disabled' : 'Person/pose + scene'} · ${actionText}`;
+  if(d.source_kind==='offline') actionText+=` · Offline ${d.frame_id+1}/${d.total_frames || '?'} frames · ${(stats.duration>0?stats.frames/stats.duration:0).toFixed(1)} avg processed FPS · ${(stats.duration>0 && d.source_fps>0?stats.frames/stats.duration/d.source_fps:0).toFixed(2)}x source speed`;
+  if(action.decision_gap_seconds!=null) actionText+=` · last decision gap ${action.decision_gap_seconds.toFixed(2)}s / target ${action.configured_stride_seconds}s`;
+  if(action.reason) actionText+=` · ${action.reason}`;
+  if(action.score!==null && action.score!==undefined) actionText+=` · score ${action.score.toFixed(3)} / threshold ${action.threshold} · window ${action.window_start.toFixed(2)}–${action.window_end.toFixed(2)}s`;
+  setText(`scene-${stream_id}`,actionText);
+  const sceneEl=document.getElementById(`scene-${stream_id}`);
+  if(sceneEl) sceneEl.style.color=action.state==='suspected_fight'?'#ff556d':'#b8d5cf';
+  setText("status-text", "Connected · scene action " + (actionNames[action.state] || action.state));
 
   // Draw bounding boxes on the grid card's overlay canvas
   const boxCanvas = document.getElementById(`box-canvas-${stream_id}`);
   if (boxCanvas) {
-    drawBoxes(boxCanvas, boxes || [], track_ids || [], activities || {});
+    boxCanvas.getContext("2d").clearRect(0, 0, boxCanvas.width, boxCanvas.height);
     const ov = document.getElementById(`overlay-${stream_id}`);
-    if (ov && boxes && boxes.length > 0) ov.classList.add("hidden");
+    if (ov) ov.classList.add("hidden");
   }
 
   // Detail view canvas
   if (detailStreamId === stream_id) {
     const dc = document.getElementById("detail-box-canvas");
     if (dc) {
-      drawBoxes(dc, boxes || [], track_ids || [], activities || {});
+      paintDetailFrame();
       document.getElementById("detail-overlay-msg").classList.add("hidden");
     }
     document.getElementById("detail-live-badge").style.display = S.running ? "" : "none";
@@ -700,6 +627,26 @@ socket.on("frame_meta", d => {
     S.lastBhvr[stream_id] = activities;
     renderBehaviorStrip(stream_id);
   }
+});
+
+function showSceneEvent(d,notify=true) {
+  if(d.phase==='start') { S.totalDets++; setText('sys-dets',S.totalDets); }
+  const transition=d.phase==='observation_lost' ? 'observation lost — fight outcome unknown' :
+    d.phase==='end' ? 'fight no longer detected' : 'suspected-fight alert start';
+  const message=`Stream ${d.stream_id+1}: ${transition} at ${Number(d.source_time).toFixed(2)}s${d.reason ? ' · '+d.reason : ''}`;
+  if(notify) toast(message,d.phase==='start'?'error':'');
+  const history=document.getElementById(`scene-events-${d.stream_id}`);
+  if(history) {
+    const row=document.createElement('div'); row.textContent=message;
+    history.prepend(row);
+    while(history.children.length>8) history.lastChild.remove();
+  }
+}
+socket.on('scene_alert',d=>showSceneEvent(d));
+socket.on('scene_history',items=>{
+  S.totalDets=0; setText('sys-dets',0);
+  document.querySelectorAll('[id^="scene-events-"]').forEach(e=>e.textContent='');
+  items.forEach(d=>showSceneEvent(d,false));
 });
 
 // P2: behavior_alert is ONLY emitted for fight-type events (see main.py emit_loop).
@@ -796,7 +743,7 @@ function renderSidebar() {
     <div class="stream-item" id="si-${i}" onclick="openDetail(${i})">
       <span class="stream-number">${i+1}</span>
       <div class="stream-info"><div class="stream-label">${esc(s.label)}</div><div class="stream-url">${esc(s.url)}</div></div>
-      ${S.running?`<span class="live-badge">Live</span>`:''}
+      ${S.running?`<span class="live-badge">Running</span>`:''}
       <span class="stream-fps" id="sifps-${i}">—</span>
       <button class="stream-remove" onclick="event.stopPropagation();removeStream(${i})" title="Remove">×</button>
     </div>`).join("");
@@ -816,6 +763,7 @@ function renderGrid() {
     <div class="stream-card" id="card-${i}" onclick="openDetail(${i})">
       <div class="stream-card-header">
         <span class="stream-card-title">${esc(s.label)}</span>
+        <span class="stream-card-activity" id="cstate-${i}">Waiting</span>
         <span class="stream-card-persons" id="cpersons-${i}">— persons</span>
         <span class="stream-card-fps" id="cfps-${i}">—</span>
         <button class="stream-card-expand" onclick="event.stopPropagation();openDetail(${i})" title="Open detail">⤢</button>
@@ -826,13 +774,15 @@ function renderGrid() {
              style="object-fit:contain;"
              onerror="this.src=''">
         <canvas class="box-canvas-layer" id="box-canvas-${i}"></canvas>
-        <div class="stream-overlay" id="overlay-${i}">
+        <div class="stream-overlay ${S.streamStats[i]?.frames ? 'hidden' : ''}" id="overlay-${i}">
           <span style="font-size:28px">📹</span>
           <span style="font-size:10px;text-align:center;padding:0 12px;">${esc(s.url)}</span>
           <span style="color:var(--muted);font-size:9px;">Waiting for frames…</span>
         </div>
         <span class="click-hint">⤢ Click to expand</span>
       </div>
+      <div id="scene-${i}" style="padding:10px;font-size:12px;line-height:1.5">Action model: waiting for status</div>
+      <div id="scene-events-${i}" style="padding:0 10px 10px;font-size:11px;max-height:90px;overflow:auto"></div>
     </div>`).join("");
 }
 
@@ -849,7 +799,7 @@ function renderBehaviorStrip(streamId) {
   const strip = document.getElementById(`bhvr-strip-${streamId}`);
   if (!strip) return;
   const byPerson = S.lastBhvr[streamId] || {};
-  const entries = Object.entries(byPerson);
+  const entries = Object.entries(byPerson).filter(([,label]) => label);
   if (!entries.length) { strip.innerHTML = ''; return; }
   strip.innerHTML = entries.slice(0, 6).map(([tid, lbl]) =>
     `<span class="bhvr-chip ${lbl}">
@@ -883,7 +833,7 @@ function updateSidebarStats(i, s) {
       <span style="color:var(--muted);font-size:9px;margin-left:auto;">${s.fps} fps</span>
     </div>
     <div style="display:flex;gap:10px;color:var(--muted);font-size:9px;">
-      <span>Model: <b style="color:var(--text);">${s.model.avg}ms</b></span>
+      <span>Pose: <b style="color:var(--text);">${s.model.avg}ms</b></span>
       <span>E2E: <b style="color:var(--text);">${s.e2e.avg}ms</b></span>
       <span>P95: <b style="color:var(--text);">${s.e2e.p95}ms</b></span>
     </div>`;
@@ -1012,11 +962,12 @@ function openDetail(idx) {
 
   // P4: set MJPEG src; clear box canvas
   const di = document.getElementById("detail-mjpeg");
-  di.src = S.running ? `/video_feed/${idx}` : '';
+  di.src = ''; // Detail copies the already-decoded grid image; no second MJPEG request.
   const dc = document.getElementById("detail-box-canvas");
   if (dc) { dc.getContext("2d").clearRect(0, 0, dc.width, dc.height); }
 
-  document.getElementById("detail-overlay-msg").classList.remove("hidden");
+  document.getElementById("detail-overlay-msg").classList.toggle("hidden", !!S.streamStats[idx]?.frames);
+  paintDetailFrame();
   if (S.streamStats[idx]) updateDetailStats(S.streamStats[idx]);
   const overlay = document.getElementById("detail-overlay");
   overlay.classList.add("open", "hud-pinned");
@@ -1024,7 +975,32 @@ function openDetail(idx) {
   clearTimeout(overlay._hudTimer);
   overlay._hudTimer = setTimeout(() => overlay.classList.remove("hud-pinned"), 2500);
 }
+let detailAnimation = null;
+function paintDetailFrame() {
+  if (detailAnimation !== null) cancelAnimationFrame(detailAnimation);
+  detailAnimation = null;
+  if (detailStreamId === null) return;
+  const source = document.getElementById(`mjpeg-${detailStreamId}`);
+  const canvas = document.getElementById("detail-box-canvas");
+  if (source && source.naturalWidth && canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(1, Math.round(rect.width));
+    const height = Math.max(1, Math.round(rect.height));
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    const scale = Math.min(width / source.naturalWidth, height / source.naturalHeight);
+    const w = source.naturalWidth * scale, h = source.naturalHeight * scale;
+    const context = canvas.getContext("2d");
+    context.fillStyle = "black"; context.fillRect(0, 0, width, height);
+    context.drawImage(source, (width-w)/2, (height-h)/2, w, h);
+    document.getElementById("detail-overlay-msg").classList.add("hidden");
+  }
+  detailAnimation = requestAnimationFrame(paintDetailFrame);
+}
+
 function closeDetail() {
+  if (detailAnimation !== null) cancelAnimationFrame(detailAnimation);
+  detailAnimation = null;
   detailStreamId = null;
   const overlay = document.getElementById("detail-overlay");
   overlay.classList.remove("open", "hud-pinned");
@@ -1085,7 +1061,7 @@ async function clearAlerts() {
   S.lastBhvr = {}; hideCrowdBanner();
 }
 async function exportCSV() {
-  const rows=[["Stream","Frames","FPS","Model Avg","Model P95","Model Max","E2E Avg","E2E P95","E2E Max"]];
+  const rows=[["Stream","Frames","FPS","Pose Avg","Pose P95","Pose Max","E2E Avg","E2E P95","E2E Max"]];
   Object.entries(S.streamStats).forEach(([idx,s])=>{
     const lbl=S.streams[idx]?S.streams[idx].label:`S${idx}`;
     rows.push([lbl,s.frames,s.fps,s.model.avg,s.model.p95,s.model.max,s.e2e.avg,s.e2e.p95,s.e2e.max]);
@@ -1120,6 +1096,31 @@ function toast(msg,type="") {
 function setText(id,val) { const el=document.getElementById(id); if(el)el.textContent=val; }
 function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function fmtNum(n) { return Number(n).toLocaleString(); }
+
+// A retained image is historical evidence, not a fresh prediction.
+setInterval(() => {
+  let freshStreams=0;
+  S.streams.forEach((_, i) => {
+    const stale = !S.running || !S.lastFrameAt[i] || Date.now() - S.lastFrameAt[i] > 3000;
+    const offline=S.sourceInfo && S.sourceInfo[i] && S.sourceInfo[i].kind==='offline';
+    if(offline) {
+      const complete=S.sourceInfo[i].complete;
+      setText(`cstate-${i}`,complete?'Offline complete · last analyzed frame':stale?'Offline stalled/stopped':'Offline processing');
+      if(!stale) freshStreams++;
+      if(detailStreamId===i) setText('detail-live-badge','OFFLINE');
+      return;
+    }
+    if(!stale) freshStreams++;
+    setText(`cstate-${i}`, stale ? "Last frame · no recent updates" : "Live");
+    if (stale) { S.lastBhvr[i] = {}; renderBehaviorStrip(i); setText(`scene-${i}`, 'Stale / disconnected · no fresh action prediction'); }
+    if (detailStreamId === i) setText("detail-live-badge", stale ? "LAST FRAME" : "● LIVE");
+  });
+  if(S.streams.length && !freshStreams) {
+    const allOffline=S.streams.every((_,i)=>S.sourceInfo && S.sourceInfo[i] && S.sourceInfo[i].kind==='offline');
+    const allComplete=allOffline && S.streams.every((_,i)=>S.sourceInfo[i].complete);
+    setText('status-text',allComplete?'Offline analysis complete · showing last results':allOffline?'Offline analysis stalled/stopped':'No fresh action predictions · streams stale or stopped');
+  }
+}, 1000);
 
 // ═══════════════════════════════════════════════════════
 //  INIT
